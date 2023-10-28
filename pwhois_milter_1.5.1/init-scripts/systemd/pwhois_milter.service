@@ -1,0 +1,12 @@
+[Unit]
+Description=Prefix Whois Mail Filter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/pwhois_milter.sh
+
+[Install]
+WantedBy=multi-user.target
+Alias=pwhois_milter.service
+

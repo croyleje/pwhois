@@ -1,0 +1,6 @@
+###################################################################################
+### See /etc/conf.d/local.start and /etc/motd about why these are commented out ###
+###################################################################################
+#05 21 * * 1,3,5,7 pwhois ((/usr/local/sbin/pwhois-snapshot-load) 2>&1) > /dev/null
+#12 03 * * 2 pwhois ((/usr/local/sbin/pwhois-arin-snapshot-load) 2>&1) > /dev/null
+#05 3 * * * root ((/etc/init.d/pwhoisd reload) 2>&1) > /dev/null

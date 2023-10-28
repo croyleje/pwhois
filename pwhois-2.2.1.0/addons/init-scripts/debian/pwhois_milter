@@ -1,0 +1,54 @@
+#!/bin/sh -e
+#
+# /etc/init.d/pwhois_milter
+#
+NAME=pwhois_milter
+PIDFILE=/var/run/${NAME}.pid
+logfile=/var/log/${NAME}.log
+uid=65534
+gid=65534
+DAEMONOPTS="-i $PIDFILE -l $logfile -u $uid -g $gid"
+# time to wait for daemon's death, in seconds
+DODTIME=5
+
+DAEMON="/usr/local/bin/$NAME"
+LABEL="Prefix Whois Milter"
+
+[ -x "$DAEMON" ] || exit 0
+
+do_stop()
+{
+	echo -n "Stopping $LABEL: "
+	start-stop-daemon --stop --pidfile "$PIDFILE" --oknodo
+	rm -f "$PIDFILE"
+	echo "$NAME."
+}
+
+do_start()
+{
+	echo -n "Starting $LABEL: "
+	touch "$logfile"
+	chown ${uid}:${gid} "$logfile"
+	start-stop-daemon --start --pidfile "$PIDFILE" --exec "$DAEMON" -- $DAEMONOPTS
+	echo "$NAME."
+}
+
+case "$1" in
+start)
+	do_start
+	;;
+stop)
+	do_stop
+	;;
+restart)
+	do_stop
+	sleep "$DODTIME"
+	do_start
+	;;
+*)
+	echo "Usage: /etc/init.d/$NAME {start|stop|restart}"
+	exit 1
+	;;
+esac
+
+exit 0

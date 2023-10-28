@@ -1,0 +1,4794 @@
+#!/usr/bin/perl
+# This file is part of PWHOIS.
+# #
+# # The PWHOIS software provided in this Distribution is
+# # Copyright 2005-14 VOSTROM Holdings, Inc.
+# #
+# # The full text of our legal notices is contained in the file called
+# # COPYING, included with this Distribution
+use strict;
+use DBI;
+use Getopt::Long;
+use POSIX qw(strftime tmpnam O_RDWR O_CREAT O_EXCL);
+use Fcntl qw(:DEFAULT :flock);
+use Log::Dispatch;
+use Log::Dispatch::Screen;
+use Log::Dispatch::File;
+use Net::Telnet;
+use Net::CIDR;
+use RPSL::Parser;
+use utf8;
+no utf8;
+
+package Pwhoisd;
+
+
+
+# globals
+my $DEBUG = 'true';
+my $VERSION = "1.2.11";
+my $COPYRIGHT = 'Copyright (c) 2005-14 VOSTROM Holdings, Inc.';
+
+# TODO: In the future we should generate alerts based on this trigger
+my $SKIP_UNMATCHED = 0;
+
+my %sources = (
+                'arin'     => 1,
+                'ripe'     => 2,
+                'apnic'    => 3,
+                'jpnic'    => 4,
+                'afrinic'  => 5,
+                'lacnic'   => 6,
+                'twnic'    => 7,
+                'krnic'    => 8,
+                'irinn'    => 9,
+                'jpirr'    => 10
+);
+
+my %netTypes = (
+                'assigned pa'            => 1,
+                'assigned portable'      => 1,
+                'assigned pi'            => 2,
+                'assigned non-portable'  => 2,
+                'early-registration'     => 3,
+                'allocated pa'           => 4,
+                'allocated portable'     => 4,
+                'allocated non-portable' => 5
+);
+
+# length of database fields
+my %fields_length = (
+                'bgp_routes.as_path'           =>  255,
+
+                'asn.asHandle'                 =>   30,
+                'asn.orgId'                    =>   30,
+                'asn.asName'                   =>   64,
+                'asn.comment'                  => 2000,
+                'asn.adminHandle'              =>   30,
+                'asn.techHandle'               =>   30,
+                'asn.as_orgname'               =>  128,
+                'asn.mailbox'                  =>   64,
+
+                'netblock.netHandle'           =>   30,
+                'netblock.orgId'               =>   30,
+                'netblock.parent'              =>   40,
+                'netblock.netName'             =>   64,
+                'netblock.netRange'            =>   64,
+                'netblock.comment'             => 2000,
+                'netblock.ns'                  =>  255,
+                'netblock.nocHandle'           =>   30,
+                'netblock.techHandle'          =>   30,
+                'netblock.abuseHandle'         =>   30,
+                'netblock.orgname'             =>  128,
+                'netblock.mailbox'             =>   64,
+
+                'organization.orgId'           =>   30,
+                'organization.orgName'         =>  128,
+                'organization.addrs'           =>  128,
+                'organization.comment'         => 2000,
+                'organization.referralServer'  =>  255,
+                'organization.adminHandle'     =>   30,
+                'organization.nocHandle'       =>   30,
+                'organization.abuseHandle'     =>   30,
+                'organization.techHandle'      =>   30,
+                'organization.city'            =>   64,
+                'organization.country'         =>    2,
+
+                'poc.pocHandle'                =>   64,
+                'poc.firstName'                =>   64,
+                'poc.lastName'                 =>   64,
+                'poc.middleName'               =>   64,
+                'poc.roleName'                 =>   64,
+                'poc.addrs'                    =>  128,
+                'poc.comment'                  => 2000,
+                'poc.officePhone'              =>  128,
+                'poc.mailbox'                  =>   64,
+                'poc.country'                  =>    2
+);
+
+my %iana_reg;
+my @iana_net;
+#my $iana_XML_file;
+my $current_registry = -1;
+
+# DO NOT MODIFY UNLESS YOU KNOW WHAT YOU ARE DOING: EDIT THE CONFIG FILE IF POSSIBLE
+# See: /etc/pwhois/pwhoisd.conf or -c option to specify a different config file
+
+my $DEFAULT_CONFIG = '/etc/pwhois/pwhoisd.conf';
+my $DEFAULT_PIDFILE='/var/run/pwhoisd.pid';
+my $DEFAULT_DATABASE_TYPE = 'mysql';
+my $DEFAULT_DATABASE_SERVER = '';
+my $DEFAULT_DATABASE_USER = 'pwhois';
+my $DEFAULT_DATABASE_PASSWD = '';
+my $DEFAULT_DATABASE_NAME = 'pwhois';
+my $DEFAULT_MINIMUM_FILE_SIZE = 380000000;		# based upon routeview3 (minus a bit)
+
+# connection settings for the remote download of BGP routes
+
+my $DEFAULT_HOST='localhost';
+my $DEFAULT_PORT=23;
+my $DEFAULT_PASSWORD='pwhois';
+my $DEFAULT_USER='pwhois';
+my $DEFAULT_TIMEOUT=10800; # three hours
+my $DEFAULT_RECORD_DB_CHUNK_SIZE=10000;
+my $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE=100000;
+my $DEFAULT_ROUTER_ID=0;   # used when reading from a file
+my $MAX_ASNS=255;
+
+# DO NOT EDIT BELOW THIS LINE
+
+my $dbh;
+my $dsn = 'NA';		# do not edit: these are changed later from defaults or config
+my $user = 'NA';	# do not edit: these are changed later from defaults or config
+my $password = 'NA';    # do not edit: these are changed later from defaults or config
+
+my $select_from_bgp_routes_by_prefix_sth;
+my $select_from_bgp_routes_by_prefix_nocidr_sth;
+my $insert_into_bgp_routes_sth;
+my $update_bgp_routes_sth;
+my $update_bgp_routes_expired_sth;
+# ------------------------------------------------------------------------
+my $select_from_bgp_routes_number_of_routes;
+my $select_from_bgp_routes_best_route;
+my $select_from_bgp_routes_number_of_routes_class;
+my $select_from_bgp_routes_best_route_class;
+my $update_bgp_routes_set_best_route;
+my $update_bgp_routes_set_all_routes_inactive;
+my $update_bgp_routes_set_all_routes_inactive_with_date;
+my $select_maxdate_from_bgp_routes_sth;
+# ------------------------------------------------------------------------
+my $select_from_asn_by_asn_sth;
+my $select_from_asn_by_asn_1_sth;
+my $insert_into_asn_sth;
+my $insert_into_asn_rpsl_sth;
+my $update_asn_sth;
+my $update_asn_rpsl_sth;
+my $select_from_netblock_by_nethandle_sth;
+my $select_from_netblock_by_netrange_sth;
+my $insert_into_netblock_sth;
+my $insert_into_netblock_rpsl_sth;
+my $update_netblock_sth;
+my $update_netblock_rpsl_sth;
+my $update_netblock_expired_sth;
+my $select_from_org_by_orgname_sth;
+my $select_from_org_by_orgid_sth;
+my $insert_into_org_sth;
+my $update_org_sth;
+my $select_from_poc_by_pochandle_sth;
+my $insert_into_poc_sth;
+my $update_poc_sth;
+
+# define to skip over certain types of records within the ARIN data dump (used mostly for debugging purposes)
+my $skipAsn = 0;
+my $skipNet = 0;
+my $skipOrg = 0;
+my $skipPOC = 0;
+
+# enviroment
+
+$ENV{'TZ'} = 'GMT';
+
+my %locks = ( 
+'parse' => '/tmp/.pwhois-updatedb.LCK',
+);
+
+my $CAT = '/bin/cat';
+my $PS = '/bin/ps -ax';
+
+#log handle
+my %config = ();
+my $log;
+my %opt = ();
+#my %routes = ();
+
+# install signal handlers
+$SIG{HUP} = 'IGNORE';
+$SIG{INT} = \&shutdown;
+$SIG{TERM} = \&shutdown;
+$SIG{KILL} = \&shutdown;
+$SIG{QUIT} = 'IGNORE';    # ignore SIGQUIT
+$SIG{'ABRT'} = '&shutdown';
+$SIG{__WARN__} =\&handle_warn;
+$SIG{__DIE__} = \&shutdown;
+
+sub new {
+   my $self = {};
+   my $class = shift;
+   return bless _init($self), $class
+}
+
+sub _init {
+   my $self = shift;
+
+   processArgs();
+
+   openConfigFile();
+  # connect to the database
+   openDatabase();
+
+   return $self
+}
+
+sub processArgs
+{
+        # change our process name in the PS list
+        #$0 = "pwhoisd";
+
+        Getopt::Long::Configure('no_ignore_case');
+        Getopt::Long::GetOptions(\%opt, 'help|h', 'logfile|l=s', 'version|V', 'verbose|v+',
+				'configfile|c=s',
+				'port|p=n', 'host=s', 'user|u=s', 'password|passwd|P=s', 'display-only',
+				'filter-by-source-as=n',
+                'no-fib',
+				'send-keep-alive',
+				'infile|i=s',
+				'router-id|r=s',
+                'skip=n',
+				'import-whois-dump|w',
+                'import-rpsl-dump|import-rpsl2-dump|R',
+                'import-mrt-dump|m',
+                'registry-xml|x=s',
+				'minimum-file-size|M=n',
+                'use-locks!',
+				'whois-source|s=s'
+                ) or die "Can't parse command-line options";
+        usage() if $opt{help};
+
+	# config file
+	if(!defined($opt{'configfile'})) {
+		$opt{'configfile'} = $DEFAULT_CONFIG;
+	}
+
+        # set version output to 0
+        if(!defined($opt{verbose})) {
+                $DEBUG = 'false';
+		$opt{verbose} = 0;
+        }
+	else
+	{
+		if($opt{verbose} >= 2) {
+                        $DEBUG = 'true';
+                }
+	}
+
+        if($opt{version}) {
+                print "$0 $VERSION\n";
+                print "Copyright (c) 2005-13 VOSTROM Holdings, Inc.\n";
+                exit;
+        }
+
+	if($opt{logfile}) {
+	        #  open our log file ... nothing should be written to stdout or stderr
+        	# from now on
+
+		if(! -f $opt{logfile}) {
+			system("touch ". $opt{logfile});
+		}
+		$log = Log::Dispatch::File->new( name      => 'file1',
+                                       #min_level => 'info',
+                                       min_level => 'debug',
+                                       filename  => "$opt{logfile}",
+                                       mode      => 'append');
+
+        }
+        else
+        {
+                  $log = Log::Dispatch::Screen->new( name      => 'screen',
+                                                      min_level => 'debug',
+                                                      stderr    => 0 );
+        }
+
+	# set the default port listenn on
+	if(!defined($opt{'port'})) {
+		$opt{'port'} = $DEFAULT_PORT;
+	}
+
+	# set the default host to connect to
+	if(!defined($opt{'host'})) {
+		$opt{'host'} = $DEFAULT_HOST;
+	}
+
+	# set the default host to connect to
+	if(!defined($opt{'user'})) {
+		$opt{'user'} = $DEFAULT_USER;
+	}
+
+	# set the default host to connect to
+	if(!defined($opt{'password'})) {
+		$opt{'password'} = $DEFAULT_PASSWORD;
+	}
+
+	# set the default router id (used only for reading from a file)
+	if(!defined($opt{'router-id'})) {
+		$opt{'router-id'} = $DEFAULT_ROUTER_ID;
+	}
+	
+	if(!defined($opt{'minimum-file-size'})) {
+		$opt{'minimum-file-size'} = $DEFAULT_MINIMUM_FILE_SIZE;
+	}
+    
+    if(!defined($opt{'use-locks'})) {
+        $opt{'use-locks'} = 1;
+    }
+    
+    if(!defined($opt{'no-fib'})) {
+        $opt{'no-fib'} = 0;
+    }
+
+	$log->log( level => 'info', message => "$0 started at ". getDateTimeFormat(time()) ."\n") if $opt{verbose};
+}
+
+
+sub usage
+{
+        print "usage: $0 [*options*]\n\n",
+              "  -h, --help         display this help and exit\n",
+              "  -v, --verbose      be verbose about what you do\n",
+              "  -V, --version      output version information and exit\n",
+              "  -l, --logfile f    write misc progress output to logfile f instead of stdout\n",
+      	      "  -c, --configfile f   read startup settings from configuration file: default is $DEFAULT_CONFIG\n",
+	      "  --host <host>            The BGP host IP to connect to.\n",
+	      "  --user|-u <user>         The user login name.\n",
+	      "  --password|passwd <pass> The password for this user.\n",
+	      "  --port <n>           The BGP host port to connect to: default: $DEFAULT_PORT\n",
+	      "  --display-only		  Display the information on the screen only, don't put in db.\n",
+	      "  --filter-by-source-as <asn>     this option when retreiving data from a local peer not a route-view\n",
+	      "            and filter (select) only routes announced by this AS (useful so you can remove your AS from the path).\n",
+          "  --no-fib                 Indicate that the RIB being downloaded has no 'best' route marked and therefore for workflow reasons we'll just pick the first one\n",
+	      "  -i, --infile f	  	  Read the BGP routes from the input file instead of connect over a socket\n",
+		  "  --minimum-file-size|-M   Specify a minimum file size (in bytes) as a safety mechanism (Default is:  $DEFAULT_MINIMUM_FILE_SIZE)\n",
+	      "  -r, --router-id <id>	  When reading from a file (which doesn't have a router-id), useful to override\n",
+	      "            the router-id used to updating the data in the database (default is 0)\n",
+          "  --skip N                Skip N record (or objects) from begining of file",
+          "  --send-keep-alive       Send keep-alive messages in session with route server\n",
+          "  --import-whois-dump|-w  Read the WHOIS information (in ARIN dump format) from file (via -i) and import into database\n",
+		  "  --import-rpsl-dump|-r   Read the WHOIS information (in RPSL(2) format) from file (via -i) and import into database\n",
+          "  --import-mrt-dump|-m    Read the BGP routes information (in MRT format) from file (via -i) and import into database\n",
+		  "  --whois-source|-s <RIR> Specify WHOIS source by RIR name, required for WHOIS import\n",
+          "  --registry-xml f        The IANA IPv4 address space registry xml-file using\n";
+;
+
+        exit;
+}
+# error or warning occurred, bail out
+sub handle_warn($)
+{
+        my $msg = shift;
+	if(defined($log)) {
+	        $log->log(level=>'warning', message=>"Warning: $msg\n") if $opt{verbose} >= 1;
+	}
+	else
+	{
+	        print STDERR "Warning: $msg\n" if $opt{verbose} >= 1;
+
+	}
+}
+
+sub handle_error($)
+{
+        my $msg = shift;
+	if(defined($log)) {
+	        $log->log(level=>'error', message=>"Error: $msg\n") if $opt{verbose} >= 1;
+	}
+	else
+	{
+	        print STDERR "Error: $msg\n" if $opt{verbose} >= 1;
+
+	}
+        &shutdown;
+}
+
+sub shutdown
+{
+    my $rc = shift;
+    my $filename = shift;
+    $rc = 0 if !defined($rc);
+    
+	if(defined($log)) {
+        	$log->log(level=>'info', message=>"$0 shutdown requested.\n") if $opt{verbose} >= 1;
+       	}
+	closeDatabase();
+    
+    if($opt{'use-locks'}) {
+        my $rc = flock(LOCKFILE, $Fnctl::LOCK_UN);
+        $rc = unlink($filename) if defined($filename);
+    }
+        exit($rc);
+}
+
+
+sub singleton_lock($) {
+    my $filename = shift;
+    my $rc = 0;
+    if($opt{'use-locks'}) {
+        
+        if (-e $filename) {
+            my ($running, $old_pid) = process_running($filename);
+            if($running) {
+                print "$filename exists, process ($old_pid) running - exiting!\n";
+                exit(-5);
+            }
+        }
+        if (! -f $filename) {
+            $rc = open(LOCKFILE, "+>$filename");
+        }
+        else {
+            $rc = open(LOCKFILE, "+<$filename");
+        }
+        if($rc <= 0) {
+            cleanup_and_exit("Can not create lock file -- can not continue!", $filename);
+        }
+        $rc = flock(LOCKFILE, $Fnctl::LOCK_EX | $Fnctl::LOCK_NB);
+        if($rc != 0) {
+            cleanup_and_exit("Lock found ($filename) -- can not continue!: $!", $filename);
+        }
+        else {
+            #logger(0, "Acquired lock $filename");
+        }
+        $rc = truncate(LOCKFILE, 0);
+        $rc = seek(LOCKFILE, 0, $Fnctl::SEEK_SET);
+        print LOCKFILE "$$";
+    }
+    return $rc;
+}
+
+sub singleton_unlock
+{
+    my $filename = shift;
+    my $rc = 0;
+    if($opt{'use-locks'}) {
+        $rc = flock(LOCKFILE, $Fnctl::LOCK_UN);
+    }
+    $rc = close(LOCKFILE);
+    $rc = unlink($filename) if defined($filename);
+    return $rc;
+}
+
+sub process_running($) {
+    my $old_pidfile =  shift; 
+    my $found_pspid = 0;   
+    my $old_pid;
+    if(-r $old_pidfile)  {
+        # check pid
+        $old_pid = `$CAT $old_pidfile`;
+        $old_pid =~ /^(\d+)/;
+        my $has_pid = ($1) ? 1 : 0;
+        
+        if($has_pid) {
+            open PSLIST, "$PS -p $old_pid |";
+            my @ps = <PSLIST>;
+            close PSLIST;
+            foreach(@ps) {
+                next if $_ =~ /\sPID/;  # skip the first line
+                $_ =~ /^\s*(\d+)/;
+                $found_pspid = ($1) ? 1 : 0;
+            }
+        }
+        else {
+            $found_pspid = 1;
+            $old_pid = -1;
+        }
+    }
+    return ($found_pspid, $old_pid);
+}
+
+
+sub openConfigFile()
+{
+	if(defined($opt{'configfile'})) {
+		if(-r $opt{'configfile'}) {
+			open(CONFIG, $opt{'configfile'}) or die "Can't open config file: $!";
+			while(<CONFIG>) {
+
+				next if $_ =~ /^\s*#.*$/;  # skip comments
+				next if $_ =~ /^\s+$/;	# skip blank lines
+
+				my ($name,$value) = ($_ =~ /^\s*([A-z0-9_\-.]+) ?= ?"?([^"\r\n]*)"? ?$/);
+				my $display_value = $value;
+				if($name =~ /^.*\.password$/i) {
+					$display_value = '<hidden>';
+				}
+				$log->log(level=>"info", message=>"Found setting $name => $display_value\n") if $opt{verbose} >=1;
+
+				$config{$name} = $value;
+			}
+			close(CONFIG);
+		}
+	}
+	else
+	{
+
+	}
+
+	# configure based upon configuration settings
+
+	my $database = $DEFAULT_DATABASE_TYPE;
+	my $dbserver = $DEFAULT_DATABASE_SERVER;
+	my $dbuser = $DEFAULT_DATABASE_USER;
+	my $dbpasswd = $DEFAULT_DATABASE_PASSWD;
+	my $dbname = $DEFAULT_DATABASE_NAME;
+
+	if(defined($config{'db.type'})) {
+		$database = $config{'db.type'};
+	}
+
+	if(defined($config{'db.server'})) {
+		$dbserver = $config{'db.server'};
+	}
+
+	if(defined($config{'db.name'})) {
+		$dbname = $config{'db.name'};
+	}
+
+	if(defined($config{'db.user'})) {
+		$dbuser = $config{'db.user'};
+		$user = $dbuser;
+	}
+
+	if(defined($config{'db.password'})) {
+		$dbpasswd = $config{'db.password'};
+		$password = $dbpasswd;
+	}
+
+	# configure the DSN
+
+	if($database eq 'postgres' or
+	   $database eq 'pgsql' or
+	   $database eq 'postgresql')
+	{
+		if($dbserver ne '' and $dbserver ne 'localhost') {
+				$dsn = "dbi:Pg:dbname=$dbname;host=$dbserver";
+		}
+		else {  # use the Unix Domain Socket (for localhost access)
+			$dsn = "dbi:Pg:dbname=$dbname";
+		}
+	}
+	elsif($database eq 'mysql')
+	{
+		$dsn = "dbi:mysql:dbname=$dbname:$dbserver";
+	}
+	else
+	{
+		$log->log(level=>"error", message=>"Invalid database type specified '$database'\n");
+		exit(0);
+	}
+
+		# configure other settings (config-file options override command-line except verbose)
+	if(defined($config{'pwhois-updatedb.verbose'}) and !defined($opt{'verbose'}))
+	{
+		if($config{'pwhois-updatedb.verbose'} =~ /\d+/) {
+			$opt{'verbose'} = $config{'pwhois-updatedb.verbose'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'pwhois-updatedb.verbose'\n");
+			exit(-1);
+		}
+	}
+
+	# log file on command-line overwrites
+	if(defined($config{'pwhois-updatedb.logfile'}) and !defined($opt{logfile}))
+	{
+		if($config{'pwhois-updatedb.logfile'} =~ /[A-z0-9\-_\/ \.]+/) {
+			$opt{'logfile'} = $config{'pwhois-updatedb.logfile'};
+
+			# close the current log
+			# $log->close();
+
+			# open the log file (it may have been open before on the console)
+
+			if($opt{logfile}) {
+			                #  open our log file ... nothing should be written to stdout or stderr
+					#                  # from now on
+
+					if(! -f $opt{logfile}) {
+						system("touch ". $opt{logfile});
+					}
+					$log = Log::Dispatch::File->new( name      => 'file1',
+									min_level => 'debug',
+									filename  => "$opt{logfile}",
+									mode      => 'append');
+			}
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'pwhois-updatedb.logfile'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1'}))
+	{
+		if($config{'routeview.1'} =~ /[A-z0-9\-\.]+/) {
+			$opt{'host'} = $config{'routeview.1'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1.port'}))
+	{
+		if($config{'routeview.1.port'} =~ /\d+/) {
+			$opt{'port'} = $config{'routeview.1.port'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1.port'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1.user'}))
+	{
+		if($config{'routeview.1.user'} =~ /\w+/) {
+			$opt{'user'} = $config{'routeview.1.user'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1.user'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1.password'}))
+	{
+		if($config{'routeview.1.password'} =~ /\w+/) {
+			$opt{'password'} = $config{'routeview.1.password'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1.password'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1.filter-by-source-as'}))
+	{
+		if($config{'routeview.1.filter-by-source-as'} =~ /\d+/) {
+			$opt{'filter-by-source-as'} = $config{'routeview.1.filter-by-source-as'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1.filter-by-source-as'\n");
+			exit(-1);
+		}
+	}
+
+	if(defined($config{'routeview.1.send-keep-alive'}))
+	{
+		if($config{'routeview.1.send-keep-alive'} == 0 or $config{'routeview.1.send-keep-alive'} == 1)
+		{
+			$opt{'send-keep-alive'} = $config{'routeview.1.send-keep-alive'};
+		}
+		else
+		{
+			$log->log(level=>"error", message=>"Invalid configuration option value for 'routeview.1.send-keep-alive'\n");
+			exit(-1);
+		}
+	}
+}
+
+
+# open the database and create prepared statements
+sub openDatabase()
+{
+	$dbh = DBI->connect($dsn, $user, $password,
+                  { RaiseError => 1, AutoCommit => 0 })
+		or die "Can't open database: $DBI::errstr";
+
+	$log->log(level=>"debug", message=>"Database opened dsn=$dsn\n") if $DEBUG eq 'true';
+
+   $dbh->do("set character_set_client=latin1") or die "Can't execute statement";
+
+	$select_from_bgp_routes_by_prefix_sth = $dbh->prepare(qq(
+	  	SELECT id FROM bgp_routes
+		WHERE network=? AND cidr=? AND next_hop=? AND router_id=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+	$select_from_bgp_routes_by_prefix_nocidr_sth = $dbh->prepare(qq(
+	 	SELECT id FROM bgp_routes
+		WHERE network=? AND cidr is null AND next_hop=? AND router_id=?
+		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	$update_bgp_routes_expired_sth = $dbh->prepare(qq(
+		UPDATE bgp_routes SET status=0 WHERE status=1 AND modifyDate < ?
+		)) or die "Can't prepare statement: $DBI::errstr";
+
+	$insert_into_bgp_routes_sth = $dbh->prepare(qq(
+      		INSERT INTO bgp_routes (router_id, network, cidr, next_hop, asn, asn_paths, createDate, modifyDate, status, best_route)
+		VALUES (?,?,?,?,?,?,?,?,?,?)
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	$update_bgp_routes_sth = $dbh->prepare(qq(
+		UPDATE bgp_routes SET asn=?, asn_paths=?, modifyDate=?, best_route=?, status=1
+		WHERE id=?
+		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+    $select_maxdate_from_bgp_routes_sth = $dbh->prepare(qq(
+        SELECT max(modifydate) from bgp_routes
+        ))
+        or die "Can't prepare statement: $DBI::errstr";
+
+# ------------------------------------------------------------------------
+# *******************   BEST ROUTE DEFINITION   **************************
+# calculate a number of active routes for (network, cidr, router_id)
+# select the record id for (network, cidr, router_id)
+# update dest_route field for found id
+# ------------------------------------------------------------------------
+
+    $select_from_bgp_routes_number_of_routes = $dbh->prepare(qq(
+            SELECT count(*) FROM bgp_routes
+            WHERE network=? AND cidr=? AND status=1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_bgp_routes_number_of_routes_class = $dbh->prepare(qq(
+            SELECT count(*) FROM bgp_routes
+            WHERE network=? AND (cidr=? OR cidr is null) AND status=1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_bgp_routes_best_route = $dbh->prepare(qq(
+            SELECT id FROM bgp_routes
+            WHERE network=? AND cidr=? AND status=1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_bgp_routes_best_route_class = $dbh->prepare(qq(
+            SELECT id FROM bgp_routes
+            WHERE network=? AND (cidr=? OR cidr is null) AND status=1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $update_bgp_routes_set_best_route = $dbh->prepare(qq(
+            UPDATE bgp_routes SET best_route=? WHERE id=?
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+# ------------------------------------------------------------------------
+# set all routes as inactive
+# ------------------------------------------------------------------------
+    #$update_bgp_routes_set_all_routes_inactive = $dbh->prepare(qq(
+    #        update bgp_routes set status = 0
+    #        ))
+    #        or die "Can't prepare statement: $DBI::errstr";
+
+    $update_bgp_routes_set_all_routes_inactive = $dbh->prepare(qq(
+            update bgp_routes set status = 0
+            where (network between ? and ?) and status = 1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $update_bgp_routes_set_all_routes_inactive_with_date = $dbh->prepare(qq(
+            update bgp_routes set status = 0
+            where (network between ? and ?) and status = 1 and modifydate < ?
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
+
+	$select_from_asn_by_asn_sth = $dbh->prepare(qq(
+            SELECT id FROM asn WHERE asn=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_asn_by_asn_1_sth = $dbh->prepare(qq(
+            SELECT id, org_id FROM asn WHERE asn=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+	$insert_into_asn_sth = $dbh->prepare(qq(
+      		INSERT INTO asn (asHandle, org_id, as_orgname, asn, asName, registerDate, comment, updateDate, adminHandle, techHandle, source, createDate, modifyDate, mailbox)
+			VALUES (?,?,NULL,?,?,?,?,?,NULL,?,?,?,?,NULL)
+      		))
+            or die "Can't prepare statement: $DBI::errstr";
+
+	# RPSL version that inserts the AS ORGNAME FIELD
+	$insert_into_asn_rpsl_sth = $dbh->prepare(qq(
+      		INSERT INTO asn (asHandle, org_id, as_orgname, asn, asName, registerDate, comment, updateDate, adminHandle, techHandle, source, createDate, modifyDate, mailbox)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      		))
+            or die "Can't prepare statement: $DBI::errstr";
+
+
+	$update_asn_sth = $dbh->prepare(qq(
+      		UPDATE asn SET asHandle=?, org_id=?, as_orgname=NULL, asn=?, asName=?, registerDate=?, comment=?, updateDate=?, adminHandle=NULL,
+			                techHandle=?, source=?, modifyDate=?, mailbox=NULL
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	# update the asn table using the RPSL format (which includes the AS-ORGNAME value)
+	$update_asn_rpsl_sth = $dbh->prepare(qq(
+      		UPDATE asn SET asHandle=?, org_id=?, as_orgname=?, asn=?, asName=?, registerDate=?, comment=?, updateDate=?, adminHandle=?,
+			                techHandle=?, source=?, modifyDate=?, mailbox=?
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_netblock_by_nethandle_sth = $dbh->prepare(qq(
+        SELECT id, org_id FROM netblock WHERE netHandle=? AND status=1
+            ))
+            or die "Can't prepare statement: $DBI::errstr";
+
+    $select_from_netblock_by_netrange_sth = $dbh->prepare(qq(
+        SELECT id FROM netblock WHERE netRange=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+	$insert_into_netblock_sth = $dbh->prepare(qq(
+      		INSERT INTO netblock (netHandle, org_id, parent, netName, netRange, network, enetrange, netType, registerDate, comment, updateDate,
+							 nameserver1, nameserver2, nameserver3, nameserver4, nocHandle, abuseHandle, techHandle,
+							 source, createDate, modifyDate)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+		
+	$insert_into_netblock_rpsl_sth = $dbh->prepare(qq(
+      		INSERT INTO netblock (netHandle, orgname, org_id, parent, netName, netRange, network, enetrange, netType, registerDate, comment, updateDate,
+							 nameserver1, nameserver2, nameserver3, nameserver4, nocHandle, abuseHandle, techHandle,
+							 source, createDate, modifyDate, mailbox)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+		
+	$update_netblock_sth = $dbh->prepare(qq(
+      		UPDATE netblock SET netHandle=?, org_id=?, parent=?, netName=?, netRange=?, network=?, enetrange=?, netType=?, registerDate=?,
+							          comment=?, updateDate=?, nameserver1=?, nameserver2=?, nameserver3=?, nameserver4=?,
+									  nocHandle=?, abuseHandle=?, techHandle=?, source=?, modifyDate=?
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+		
+	$update_netblock_rpsl_sth = $dbh->prepare(qq(
+      		UPDATE netblock SET netHandle=?, orgname=?, org_id=?, parent=?, netName=?, netRange=?, network=?, enetrange=?, netType=?, registerDate=?,
+							          comment=?, updateDate=?, nameserver1=?, nameserver2=?, nameserver3=?, nameserver4=?,
+									  nocHandle=?, abuseHandle=?, techHandle=?, source=?, modifyDate=?, mailbox=?
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	$update_netblock_expired_sth = $dbh->prepare(qq(
+		UPDATE netblock SET status=0 WHERE source=? AND status=1 AND modifyDate < ?
+			))
+		or die "Can't prepare statement: $DBI::errstr";
+	
+	$select_from_org_by_orgname_sth = $dbh->prepare(qq(
+	  	SELECT id FROM organization WHERE orgName=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+	$select_from_org_by_orgid_sth = $dbh->prepare(qq(
+	  	SELECT id FROM organization WHERE org_id=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+	$insert_into_org_sth = $dbh->prepare(qq(
+      		INSERT INTO organization (org_id, orgName, canAllocate, street1, street2, street3, street4, street5, street6,
+							 city, state, country, postalCode, registerDate, comment, updateDate,
+							 referralServer, adminHandle, nocHandle, abuseHandle, techHandle, source, createDate, modifyDate)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	$update_org_sth = $dbh->prepare(qq(
+      		UPDATE organization SET org_id=?, orgName=?, canAllocate=?, street1=?, street2=?, street3=?, street4=?, street5=?, street6=?,
+							    city=?, state=?, country=?, postalCode=?, registerDate=?, comment=?, updateDate=?,
+							    referralServer=?, adminHandle=?, nocHandle=?, abuseHandle=?, techHandle=?, source=?, modifyDate=?
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+
+	$select_from_poc_by_pochandle_sth = $dbh->prepare(qq(
+	  	SELECT id FROM poc WHERE pocHandle=?
+          	))
+          	or die "Can't prepare statement: $DBI::errstr";
+
+
+    $insert_into_poc_sth = $dbh->prepare(qq(
+      		INSERT INTO poc (pocHandle, isRole, firstName, lastName, middleName, roleName, street1, street2, street3, street4, street5, street6,
+							 city, state, country, postalCode, registerDate, comment, updateDate, officePhone, mailbox, source,
+							 createDate, modifyDate)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+	$update_poc_sth = $dbh->prepare(qq(
+      		UPDATE poc SET pocHandle=?, isRole=?, firstName=?, lastName=?, middleName=?, roleName=?, street1=?, street2=?, street3=?, street4=?, street5=?, street6=?,
+							 city=?, state=?, country=?, postalCode=?, registerDate=?, comment=?, updateDate=?, officePhone=?, mailbox=?, source=?,
+							modifyDate=?
+			WHERE id=?
+      		))
+		or die "Can't prepare statement: $DBI::errstr";
+
+}
+
+# close down the database connection
+sub closeDatabase()
+{
+	if(defined($log)) {
+		$log->log(level=>"debug", message=>"Database closed dsn=$dsn\n") if $DEBUG eq 'true';
+	}
+	undef $select_from_bgp_routes_by_prefix_sth;
+	undef $insert_into_bgp_routes_sth;
+	undef $update_bgp_routes_sth;
+	undef $update_bgp_routes_expired_sth;
+# ------------------------------------------------------------------------
+    undef $select_from_bgp_routes_number_of_routes;
+    undef $select_from_bgp_routes_best_route;
+    undef $select_from_bgp_routes_number_of_routes_class;
+    undef $select_from_bgp_routes_best_route_class;
+    undef $update_bgp_routes_set_best_route;
+    undef $update_bgp_routes_set_all_routes_inactive;
+    undef $update_bgp_routes_set_all_routes_inactive_with_date;
+    undef $select_maxdate_from_bgp_routes_sth;
+# ------------------------------------------------------------------------
+	undef $select_from_asn_by_asn_sth;
+    undef $select_from_asn_by_asn_1_sth;
+	undef $insert_into_asn_sth;
+	undef $insert_into_asn_rpsl_sth;
+	undef $update_asn_sth;
+	undef $update_asn_rpsl_sth;
+	undef $select_from_netblock_by_nethandle_sth;
+    undef $select_from_netblock_by_netrange_sth;
+	undef $update_netblock_sth;
+	undef $update_netblock_rpsl_sth;
+	undef $update_netblock_expired_sth;
+	undef $insert_into_netblock_sth;
+	undef $insert_into_netblock_rpsl_sth;
+	undef $select_from_org_by_orgname_sth;
+	undef $select_from_org_by_orgid_sth;
+	undef $insert_into_org_sth;
+	undef $update_org_sth;
+	undef $select_from_poc_by_pochandle_sth;
+	undef $insert_into_poc_sth;
+	undef $update_poc_sth;
+	$dbh->disconnect if defined($dbh);
+
+}
+
+sub DESTROY {
+   my $self = shift;
+   # clean up lock and temp files
+   #$self->SUPER::DESTROY
+}
+
+sub connect
+{
+        my $host = shift;
+	my $login = shift;
+	my $passwd = shift;
+
+
+	my $session = Net::Telnet->new(timeout => 10,
+				       telnetmode=>0,
+				       cmd_remove_mode => 1
+				       );
+	# change the buffer length
+	$session->max_buffer_length(10048576);
+
+	$session->open(host=>$host, port=>$opt{'port'});
+	my @results = $session->print($passwd);
+	print @results if $opt{verbose} >= 1;
+
+	if($opt{verbose} >= 3) {
+		if(!defined($opt{'logfile'})) {
+			$session->dump_log();
+		}
+	}
+
+	return $session;
+}
+
+sub disconnect
+{
+	my $session = shift;
+	if(defined($session)) {
+		$session->close();
+	}
+}
+
+# read 'show ip bgp' output directly over a telnet connection to the router
+sub readBgpUpdate()
+{
+
+	# telnet to the BGP process running on the machine specified or read from a file
+	my $lineno = 0;
+	my $record = 0;
+	my $router_id = $opt{'router-id'};  # default is 0 (if not defined by user)
+	my $cacheDate = time();
+
+
+	if(defined($opt{'infile'})) {
+		if(-f $opt{'infile'}) {
+			if(defined($opt{'minimum-file-size'})) {
+				# check the file size
+				if((stat($opt{'infile'}))[7] < $opt{'minimum-file-size'}) {
+					$log->log(level=>'error', message=>"The file is too small to import -- it must be greater or equal to ". $opt{'minimum-file-size'} ." can not continue ...\n");
+					shutdown(-5, $locks{parse});
+				}
+			}
+		}
+	
+		# read from a file
+		open(INPUT, $opt{'infile'}) or die "Can't read from input file: $!";
+
+		$log->log(level=>'info', message=>"Reading from input file: ". $opt{'infile'} ."...\n")
+				if $opt{verbose} >= 1;
+
+		while(<INPUT>)
+		{
+			($record, $lineno) = parseBgpUpdate(undef, $router_id, $lineno, $_, $record, $cacheDate);
+
+			$log->log(level=>"info", message=>"$record records processed from $lineno lines\n")
+				if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+			# commit the records to the database every 10000 records
+        		if(!defined($opt{'display-only'}) and $lineno % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+				$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+			}
+		}
+	}
+	else
+	{ # read the data directly over the "telnet" connection to the shell
+
+                if(defined($opt{'host'})) {
+			if($opt{'host'} =~ /[A-z]+/) {
+				my $ip =  resolve_hostname($opt{'host'});
+				if($ip ne 'no address') {
+					$router_id = $ip;
+				}
+				else
+				{
+					$log->log(level=>"error", message=>"Unable to resolve hostname of peer ". $opt{'host'} ."\n");
+				}
+			}
+			else
+			{
+				# assume they gave us an IP
+				$router_id = $opt{'host'};
+			}
+		}
+		$log->log(level=>'info', message=>"connecting to ". $opt{host} .":". $opt{port} ." ...  router-id=$router_id\n") if $opt{verbose} >= 1;
+
+		my $session;
+		if(defined($opt{user})) {
+			$session = &connect($opt{host}, $opt{user}, $opt{password});
+		}
+		else
+		{
+			$session = &connect($opt{host});
+		}
+
+		return 0 if !defined($session);
+		$log->log(level=>'info', message=>"Login successful -- retrieving data ...\n") if $opt{verbose} >= 1;
+
+		my $buf;
+		#$buf = $session->prompt('/^[#$>] ?[	#$>]/');
+		my @results;
+		$session->cmd("terminal length 0");
+		#$buf = $session->getline();
+		#$buf = $session->getline();
+		#$buf = $session->getline();
+		$log->log(level=>"info", message=>"Sending command='show ip bgp' timeout=$DEFAULT_TIMEOUT errmode=return\n")
+			if $opt{'verbose'} >= 1;
+
+		$session->cmd(string=>"show ip bgp", timeout=>$DEFAULT_TIMEOUT, errmode=>"return");
+
+		while(!$session->eof()) {
+			$buf = $session->getline();
+			if(!defined($buf)) {
+				my $msg = $session->errmsg();
+				$log->log(level=>"error", message=>"Error occurred during read: $msg\n");
+				$session->close();
+				last;
+			}
+			else
+			{
+				($record, $lineno) = parseBgpUpdate($session, $router_id, $lineno, $buf, $record, $cacheDate);
+
+				$log->log(level=>"info", message=>"$record records processed from $lineno lines\n")
+					if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+				if(defined($opt{'send-keep-alive'})) {
+					if($lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0)
+					{
+						$log->log(level=>'info', message=>"sending keep-alive ...\n") if $opt{verbose} >= 1;
+						$session->print("?");
+					}
+				}
+
+				# commit the records to the database every 10000 records
+        			if(!defined($opt{'display-only'}) and $lineno % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+					$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+				}
+
+				if($buf =~ /^[A-z0-9.-]+> ?$/)
+				{
+			 		$log->log(level=>'info', message=>"found command prompt.\n") if $opt{verbose} >= 2;
+					last if $record > 0;
+				}
+			}
+		}
+
+		&disconnect();
+	}
+
+	my $elapsed_sec = time() - $cacheDate;
+
+	$log->log(level=>'info', message=>"BGP routing table load completed in $elapsed_sec secs.  $lineno lines processed: $record routes updated.\n") if $opt{verbose};
+
+	if(!defined($opt{'display-only'})) {
+		# now update all the records which are no longer in the global routing table
+		$update_bgp_routes_expired_sth->execute($cacheDate)
+			or warn "Can't update records: $DBI::errstr";
+		$update_bgp_routes_expired_sth->finish();
+
+		$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+	}    
+}
+
+# used to store the last network found in the bgp routing table
+my $last_network_found;
+
+# parse Cisco 'show ip bgp' output format
+sub parseBgpUpdate($)
+{
+		my $session = shift;
+		my $router_id = shift;
+		my $line = shift;
+		my $buf = shift;
+		my $record = shift;
+		my $createDate = shift;
+		my $modifyDate = $createDate;
+
+		if(defined($opt{'host'}) and $router_id eq '') {
+
+			if($opt{'host'} =~ /[A-z]+/) {
+				my $ip =  resolve_hostname($opt{'host'});
+				if($ip ne 'no address') {
+					$router_id = $ip;
+				}
+				else
+				{
+					$log->log(level=>"error", message=>"Unable to resolve hostname of peer ". $opt{'host'} ."\n");
+				}
+			}
+			else
+			{
+				# assume they gave us an IP
+				$router_id = $opt{'host'};
+			}
+		}
+
+		# parser variables
+		my $status = '';
+		my $network = '';
+		my $nextHop = '';
+		my $metric = '';
+		my $locPrf = '';
+		my $weight = '';
+		my $path = '';
+		my $orgin = '';
+		my $update = 1;
+		my %routes = ();
+
+       #if(defined($opt{'display-only'})) {
+       #	print STDOUT $buf;
+       #}
+
+		$log->log(level=>'debug', message=>"processing line $line: $buf") if $DEBUG eq 'true' and $opt{verbose} >= 9;
+
+#	if ($buf =~ /^([sdh*i>]+)\s{1,5}([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2})?\s*([0-9\.\/]+)\s+(\d+)?\s+(\d+)?\s+([0])\s+((\{?\,?(\d+|\d+\.\d+)\s?\}?){1,$MAX_ASNS})\s+[ieshd?].*/) {
+	my $re_defs = qr/(?(DEFINE)(?<octet>[0-9]{1,3}) (?<ipv4>((?&octet)\.){3}(?&octet)) (?<ipv4net>(?&ipv4)\/[0-9]{1,2}) (?<asn>\d+|\d+\.\d+) (?<asnset>(?&asn)|\{((?&asn)\,\s?)*(?&asn)\}) (?<aspath>((?&asnset)\s+){0,$MAX_ASNS}(?&asnset)))/x;
+	my $re_single = qr/^([sdh*i>]+)\s{1,5}((?&ipv4net))?\s*([0-9\.\/]+)\s+(\d+)?\s+(\d+)?\s+([0])\s+((?&aspath))\s+[ieshd?].* $re_defs/xo;
+	if ($buf =~ /$re_single/) {
+		    ($status, $network, $nextHop, $metric, $locPrf, $weight, $path)
+			 = ($buf =~ /$re_single/);
+
+				# add the values to the hash
+
+				# if there is no network/prefix listed on the log line (usually because there are more than one router for the same prefix)
+				# get the last value and store that in the routing table -- at this point we need to mark which one is best
+				if($network eq '') {
+					$network = $last_network_found;
+				}
+
+				# skip routes that don't have a next-hop
+				next if !defined($nextHop);
+
+				$log->log(level=>'info', message=>"found network $network aspath $path \n")  if $opt{verbose} >= 5;
+
+				my ($ipaddr,$cidr) = ipv4_parse($network);
+				next if($ipaddr eq '0.0.0.0' || $cidr == 0);
+
+				$routes{$network}{'class'} = 'bgp';
+				if($status eq '*>') {
+					$routes{$network}{'status'} = 1;
+                                	$log->log(level=>'debug', message=>"found best route.\n") if $opt{'verbose'} >= 2;
+				}
+				else
+				{
+					$routes{$network}{'status'} = 0;
+				}
+				$routes{$network}{'route'} = $network;
+				$routes{$network}{'network'} = $ipaddr;
+				if($cidr ne '') {
+					$routes{$network}{'network_cidr'} = $cidr;
+				}
+
+				$routes{$network}{'locpref'} = $locPrf;
+				$routes{$network}{'nextHop'} = $nextHop;
+				$routes{$network}{'metric'} = $metric;
+				$routes{$network}{'weight'} = $weight;
+				$path =~ s/{//g;
+				$path =~ s/}//g;
+				$path =~ s/,/ /g;
+
+				# remove the first AS (this is ours)
+				my(@asn_path) = split(/ /, $path);
+
+				# if there are other routes in the routing table that we don't want to read
+				# this option
+				#
+				if(defined($opt{'filter-by-source-as'})) {
+					next if $asn_path[0] != $opt{'filter-by-source-as'};
+				}
+
+				my @asn_path_most_specific = reverse(@asn_path);
+
+				# convert to decimal if needed
+				my $asplain;
+				if($asn_path_most_specific[0] =~ /(\d+)\.(\d+)/) {
+                    if($2 == 0) {
+                        $asplain = $1;
+                    }
+                    else {
+                        $asplain = $1*65536 + $2;
+                    }					
+				}
+				else {
+					$asplain = $asn_path_most_specific[0]; 
+				}
+
+				$routes{$network}{'asn'} = $asplain;
+				$routes{$network}{'source_asn'} = $asplain;
+
+                # if no fib, override best for first route in table
+                if($network ne $last_network_found and $opt{'no-fib'}) {
+                    $routes{$network}{status} = 1;
+                }
+
+				$last_network_found = $network;
+                
+
+				# if there is more than one AS listed, then remove our AS as it
+				# is there only because we are getting the data from that provider
+				# this also helps us hide our provider and not show where we are
+				# getting our data from.
+				if(scalar(@asn_path) > 1) {
+					if(defined($opt{'filter-by-source-as'})) {
+						shift(@asn_path);
+					}
+				}
+
+                # if one AS listed more than 10 times, then remove >10 entries
+                # as we only have 255 characters to store the data in the database
+                my %asns = ();
+                my @filtered_asns = ();
+                foreach $a (@asn_path) {
+                    if (!exists($asns{$a}))  {
+                        # First time we've seen this one
+                        $asns{$a} = 0;
+                        push @filtered_asns, $a;
+                    } elsif ($asns{$a}) {
+                        # We've seen this one before and reported
+                        $asns{$a}++;
+                        if($asns{$a} < 10) {
+                            push @filtered_asns, $a;
+                        }
+                    }
+                }
+                %asns = ();                
+                
+				my $newpath = join ' ', @filtered_asns;
+				$routes{$network}{'path'} = $newpath;      # most specific is on right side
+  				$log->log(level=>'info', message=>"most specific ASN for $network is ". $routes{$network}{'asn'}
+							." next-hop=".  $routes{$network}{'nextHop'}
+							." best-route=". $routes{$network}{'status'} ."\n") if $opt{'verbose'} >= 2;
+
+				$record++;
+			}  # under some cases (long ip addresses), output is wrapped.
+			elsif ($buf =~ /^([sdh*i>]+)\s+((?&ipv4net))$ $re_defs/x) {
+				$status = $1; $network = $2;
+
+				my $newline;
+				if(defined($session)) {
+					$newline = $session->getline(); 	# advance to the next line to read rest
+				}
+				else
+				{
+					# read the next line from the input file
+					$newline = <INPUT>;
+				}
+
+				$line++;
+				$log->log(level=>'debug', message=>"processing (next) line $line: $newline") if $DEBUG eq 'true' and $opt{verbose} >= 9;
+				($nextHop, $metric, $locPrf, $weight, $path) =
+					($newline =~ /^\s+([0-9\.\/]+)\s+(\d+)?\s+(\d+)?\s+([0])?\s+((?&aspath))\s+[ieshd?].* $re_defs/x);
+
+				$log->log(level=>'info', message=>"found (wrapped) network $network aspath $path \n")  if $opt{verbose} >= 5;
+
+				# add the values to the hash
+
+				my ($ipaddr,$cidr) = ipv4_parse($network);
+
+				$routes{$network}{'class'} = 'bgp';
+				$routes{$network}{'route'} = $network;
+				$routes{$network}{'network'} = $ipaddr;
+				if($cidr ne '') {
+					$routes{$network}{'network_cidr'} = $cidr;
+				}
+
+				$routes{$network}{'locpref'} = $locPrf;
+
+				if($status eq '*>') {
+					$routes{$network}{'status'} = 1;
+				}
+				else
+				{
+					$routes{$network}{'status'} = 0;
+				}
+
+				$routes{$network}{'nextHop'} = $nextHop;
+				$routes{$network}{'metric'} = $metric;
+				$routes{$network}{'weight'} = $weight;
+				$path =~ s/{//g;
+				$path =~ s/}//g;
+				$path =~ s/,/ /g;
+
+				# remove the first AS (this is ours)
+				my(@asn_path) = split(/ /, $path);
+				my @asn_path_most_specific = reverse(@asn_path);
+
+				# convert to decimal if needed
+                my $asplain;
+                if($asn_path_most_specific[0] =~ /(\d+)\.(\d+)/) {
+                        if($2 == 0) {
+                            $asplain = $1;
+                        }
+                        else {
+                            $asplain = $1*65536 + $2;
+                        }
+                }
+                else {
+                        $asplain = $asn_path_most_specific[0];
+                }
+
+                $routes{$network}{'asn'} = $asplain;
+                $routes{$network}{'source_asn'} = $asplain;
+
+				# if there is more than one AS listed, then remove our AS as it
+				# is there only because we are getting the data from that provider
+				# this also helps us hide our provider and not show where we are
+				# getting our data from.
+				if(scalar(@asn_path) > 1) {
+					if(defined($opt{'filter-by-source-as'})) {
+				        	shift(@asn_path);
+					}
+				}
+                
+                # if one AS listed more than 10 times, then remove >10 entries
+                # as we only have 255 characters to store the data in the database
+                my %asns = ();
+                my @filtered_asns = ();
+                foreach $a (@asn_path) {
+                    if (!exists($asns{$a}))  {
+                        # First time we've seen this one
+                        $asns{$a} = 0;
+                        push @filtered_asns, $a;
+                    } elsif ($asns{$a}) {
+                        # We've seen this one before and reported
+                        $asns{$a}++;
+                        if($asns{$a} < 10) {
+                            push @filtered_asns, $a;
+                        }
+                    }
+                }
+                %asns = ();                
+
+				my $newpath = join ' ', @filtered_asns;
+				$routes{$network}{'path'} = $newpath;      # most specific is on right side
+			 	$log->log(level=>'info', message=>"most specific ASN for $network is ". $routes{$network}{'asn'}
+			                                                         ." next-hop=".  $routes{$network}{'nextHop'}
+										 ." best-route=". $routes{$network}{'status'} ."\n")
+										 if $opt{'verbose'} >= 2;
+				$record++;
+			}
+			else
+			{
+				chomp($_);
+				$log->log(level=>'debug', message=>"skipping line ... $buf \n") if $opt{verbose} >= 9;
+				$update = 0;
+			}
+
+			# only put in the database if display-only flag isn't set
+			if(!defined($opt{'display-only'})) {
+				if($update) {
+					my $sth;
+					my $found_record=0;
+					my $record_id=0;
+					if(defined($routes{$network}{'network_cidr'})) {
+
+						# determine the record already exists within the database
+						$select_from_bgp_routes_by_prefix_sth->execute(
+							ipv4_quaddot_to_decimal($routes{$network}{'network'}),
+							$routes{$network}{'network_cidr'},
+							ipv4_quaddot_to_decimal($routes{$network}{'nextHop'}),
+							ipv4_quaddot_to_decimal($router_id)
+							) or die "Can't select record: $DBI::errstr";
+						$sth = $select_from_bgp_routes_by_prefix_sth;
+						while(my($id) = $select_from_bgp_routes_by_prefix_sth->fetchrow_array()) {
+							$found_record=1;
+							$record_id = $id;
+						}
+						$select_from_bgp_routes_by_prefix_sth->finish();
+					}
+					else
+					{
+						# determine the record already exists within the database
+						$select_from_bgp_routes_by_prefix_nocidr_sth->execute(
+							ipv4_quaddot_to_decimal($routes{$network}{'network'}),
+							ipv4_quaddot_to_decimal($routes{$network}{'nextHop'}),
+							ipv4_quaddot_to_decimal($router_id)
+							) or die "Can't select record: $DBI::errstr";
+						while(my($id) = $select_from_bgp_routes_by_prefix_nocidr_sth->fetchrow_array()) {
+							$found_record=1;
+							$record_id = $id;
+						}
+						$select_from_bgp_routes_by_prefix_nocidr_sth->finish();
+					}
+
+					if($found_record) {
+						$log->log(level=>'debug', message=>"Found record for update id=$record_id\n")
+							if $opt{'verbose'} >= 5;
+
+						# update the record: set the source-as, path, date of modification, and any
+						# change in status == meaning this path may no longer be the best path
+						$update_bgp_routes_sth->execute(
+						 	$routes{$network}{'asn'},
+						 	$routes{$network}{'path'},
+						 	$modifyDate,
+						 	$routes{$network}{'status'},  # best_route
+							$record_id
+						) or die "Can't update record: $DBI::errstr";
+						$update_bgp_routes_sth->finish();
+                        
+                        $log->log(level=>'debug', message=>"updating record $record_id in bgp_routes for ".
+                        $routes{$network}{'network'} ."/". $routes{$network}{'network_cidr'}
+                        ." next-hop=". $routes{$network}{'nextHop'}
+                        ." with source-as=". $routes{$network}{'asn'}
+                        ." as-path=". $routes{$network}{'path'}
+                        ." best-route=". $routes{$network}{'status'}
+                        ."\n") if $opt{verbose} >= 4;
+                    }
+					else
+					{
+                        $log->log(level=>'debug', message=>"inserting record into bgp_routes with ".
+                        $routes{$network}{'network'} ."/". $routes{$network}{'network_cidr'}
+                        ." next-hop=". $routes{$network}{'nextHop'}
+                        ." source-as=". $routes{$network}{'asn'}
+                        ." as-path=". $routes{$network}{'path'}
+                        ." best-route=". $routes{$network}{'status'}
+                        ."\n") if $opt{verbose} >= 4;
+
+						# insert the record into the database
+						$insert_into_bgp_routes_sth->execute(
+							ipv4_quaddot_to_decimal($router_id),
+							ipv4_quaddot_to_decimal($routes{$network}{'network'}),
+							$routes{$network}{'network_cidr'},
+							ipv4_quaddot_to_decimal($routes{$network}{'nextHop'}),
+							$routes{$network}{'asn'},
+							$routes{$network}{'path'},
+							$createDate,
+							$modifyDate,
+							1,		# status is '1' = "Active"
+							$routes{$network}{'status'}
+						) or die "Can't insert record: $DBI::errstr";
+						$insert_into_bgp_routes_sth->finish();
+                    }
+				}
+			}
+
+		return ($record, ++$line);
+}
+
+# read a ARIN formatted whois update dump file and import it into the database
+sub readWhoisUpdate
+{
+	my $class = shift;
+	my $src = shift;
+	my $lineno = 0;
+	my $record = 0;
+	my $record_id;
+	my $cacheDate = time();
+    # to check 'OrgID' attribute
+    my $another_source = 0;
+
+	if(defined($opt{'infile'}))
+	{
+		# read from a file
+		open(INPUT, $opt{'infile'}) or die "Can't read from input file: $!";
+
+		$log->log(level=>'info', message=>"Reading ARIN WHOIS DUMP from input file: ". $opt{'infile'} ."...\n")
+				if $opt{verbose} >= 1;
+
+		my %rec = ();
+		while(<INPUT>)
+		{
+			$lineno++;
+		#	print $_ if $opt{verbose} >= 2;
+			next if /^\s*#$/;
+			next if /^\s*$/;
+
+			my $found_asn = 0;
+			my $found_net = 0;
+			my $found_org = 0;
+			my $found_poc = 0;
+
+			my $ncomment=0;
+			my $nnameserver=1;
+			my $nstreet=1;
+			
+			
+			
+
+			if($_ =~ /^\s*ASHandle:/)
+			{
+				$found_asn = 1;
+				my $found_source = 0;
+				# parse asn information
+				%rec = ();
+				my $nextline = $_;
+				
+				ASN_TRY_AGAIN:
+				
+		#		print "found as handle, parsing.  $nextline";
+				while($nextline =~ /^\s*[A-z\\\/]+\:.*$/) {
+					if($nextline =~ /^\s*ASHandle:\s+([A-z0-9\-\.]+)$/) {
+						$rec{'asHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*ASNumber:\s*(\d+)$/) {
+						$rec{'asn'} = $1;
+						$rec{'asn_range'} = 0;
+					}
+					# two different formats, one with just a number, this one with a range of numbers (only storing the first one)
+					elsif($nextline =~ /^\s*ASNumber:\s*(\d+) - (\d+)$/) {
+						$rec{'asn_range'} = 1;
+						$rec{'asn'} = $1;
+						$rec{'asn_end'} = $2;
+					}
+					elsif($nextline =~ /^\s*OrgID:\s*(.*)$/) {
+						$rec{'orgId'} = $1;
+					}
+					elsif($nextline =~ /^\s*ASName:\s*(.*)$/) {
+						$rec{'asName'} = $1
+					}
+					elsif($nextline =~ /^\s*RegDate:\s*(.*)$/) {
+						if($1 ne '') {
+							$rec{'registerDate'} = $1;
+						}
+						else {
+							$rec{'registerDate'} = '1970-01-01';
+						}
+					}
+					elsif($nextline =~ /^\s*Updated:\s*(.*)$/) {
+						$rec{'updateDate'} = $1;
+					}
+					elsif($nextline =~ /^\s*Comment:\s*(.*)$/) {
+						$rec{'comment'} = $1 if $ncomment == 0;
+						$rec{'comment'} .= " ". $1 if $ncomment > 0;
+						$ncomment++;
+					}
+					elsif(lc($nextline) =~ /^\s*source:\s*(.*)$/) {
+						$rec{'source_string'} = $1;
+				        $rec{'source'} = $sources{lc($1)};
+                        if($rec{'source'} < 1) { 
+                            $rec{'source'} = 0;
+                  		}
+						$found_source = 1;
+					}
+					elsif($nextline =~ /^\s*TechHandle:\s*(.*)$/) {
+						$rec{'techHandle'} = $1;
+					}
+
+				# advance to the next line
+				$nextline = <INPUT>;
+				$lineno++;
+	            # print "reading next line: $nextline";
+				}
+				if($found_asn and !$found_source) { # bad data.  Deal with by trying again until we find the source line
+					goto ASN_TRY_AGAIN;
+				}
+
+				$record++;
+
+				$log->log(level=>'error', message=>"ERROR: Record data not parsed properly for last asn (line# $lineno)\n") if !defined($rec{'asn'});
+
+                $another_source = 0;
+                if($sources{lc($rec{'orgId'})} > 0) {
+                    $another_source = 1;
+                    $log->log(level=>'debug', message=>"ASHandle: " . $rec{'asHandle'} . ", OrgID: " . $rec{'orgId'} . ". skipped\n");
+                }
+				
+				if(defined($rec{'asn'}) and !$skipAsn and !$another_source)
+				{
+					# asn range - loop through all asns inserting separate records
+					if($rec{'asn_range'} == 1)
+					{
+						my $asn = $rec{'asn'};
+						for($asn; $asn <= $rec{'asn_end'}; $asn++)
+						{
+							$rec{'asn'} = $asn;
+							my $found_record=0;
+							# update/insert into database
+							 $select_from_asn_by_asn_sth->execute($rec{'asn'}) or die "Can't select record: $DBI::errstr";;
+							 while(my($id) = $select_from_asn_by_asn_sth->fetchrow_array()) {
+								$found_record=1;
+								$record_id = $id;
+							 }
+
+							 $select_from_asn_by_asn_sth->finish();
+
+							 if($found_record) {
+
+								$log->log(level=>'debug', message=>"Found AS record: ". $rec{'asn'} ." in database -- updating ... id=". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+								$update_asn_sth->execute($rec{'asHandle'}, $rec{'orgId'}, $rec{'asn'},
+															  $rec{'asName'}, $rec{'registerDate'}, $rec{'comment'},
+															  $rec{'updateDate'}, $rec{'techHandle'}, $rec{'source'},
+															  $cacheDate, $record_id)
+										or die "Can't select record: $DBI::errstr";
+								$update_asn_sth->finish();
+							 }
+							 else {
+								$log->log(level=>'debug', message=>"Found AS record: ". $rec{'asn'} ." but not in database -- inserting ...". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+
+								$insert_into_asn_sth->execute($rec{'asHandle'}, $rec{'orgId'}, $rec{'asn'},
+															  $rec{'asName'}, $rec{'registerDate'}, $rec{'comment'},
+															  $rec{'updateDate'}, $rec{'techHandle'}, $rec{'source'},
+															  $cacheDate, $cacheDate)
+										or die "Can't select record: $DBI::errstr";
+
+								$insert_into_asn_sth->finish();
+							 }
+						}
+					}
+					else { # single ASN record (not a range record)
+						my $found_record=0;
+						# update/insert into database
+						 $select_from_asn_by_asn_sth->execute($rec{'asn'}) or die "Can't select record: $DBI::errstr";;
+						 while(my($id) = $select_from_asn_by_asn_sth->fetchrow_array()) {
+							$found_record=1;
+							$record_id = $id;
+						 }
+
+						 $select_from_asn_by_asn_sth->finish();
+
+						 if($found_record) {
+
+							$log->log(level=>'debug', message=>"Found AS record: ". $rec{'asn'} ." in database -- updating ... id=". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+							$update_asn_sth->execute($rec{'asHandle'}, $rec{'orgId'}, $rec{'asn'},
+														  $rec{'asName'}, $rec{'registerDate'}, $rec{'comment'},
+														  $rec{'updateDate'}, $rec{'techHandle'}, $rec{'source'},
+														  $cacheDate, $record_id)
+									or die "Can't select record: $DBI::errstr";
+							$update_asn_sth->finish();
+						 }
+						 else {
+							$log->log(level=>'debug', message=>"Found AS record: ". $rec{'asn'} ." but not in database -- inserting ...". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+
+							$insert_into_asn_sth->execute($rec{'asHandle'}, $rec{'orgId'}, $rec{'asn'},
+														  $rec{'asName'}, $rec{'registerDate'}, $rec{'comment'},
+														  $rec{'updateDate'}, $rec{'techHandle'}, $rec{'source'},
+														  $cacheDate, $cacheDate)
+									or die "Can't select record: $DBI::errstr";
+
+							$insert_into_asn_sth->finish();
+						 }
+					}
+				}
+
+				$log->log(level=>"info", message=>"$record AS records processed from $lineno lines\n") if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+				# commit the records to the database every N records
+				if(!defined($opt{'display-only'}) and $record % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+					$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+				}
+			} # end if parser
+			elsif($_ =~ /^\s*NetHandle:/)
+			{
+				$found_net = 1;
+				my $found_source = 0;
+
+				# parse netblock information
+				%rec = ();
+
+				# set defaults
+				$rec{'netType'} = 0;
+				$rec{'netName'} = 'UNDEFINED';
+
+				my $nextline = $_;
+				
+				NET_TRY_AGAIN:
+				
+	#			print "found net handle, parsing.  $nextline";
+				while($nextline =~ /^\s*[A-z\\\/]+\:.*$/) {
+					if($nextline =~ /^\s*NetHandle:\s+([A-z0-9\-]+)$/) {
+						$rec{'netHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*OrgID:\s*(.*)$/) {
+						$rec{'orgId'} = $1;
+					}
+					elsif($nextline =~ /^\s*Parent:\s*(.*)$/) {
+						$rec{'parent'} = $1;
+					}
+					elsif($nextline =~ /^\s*NetName:\s*(.*)$/) {
+						$rec{'netName'} = $1;
+					}
+					elsif($nextline =~ /^\s*NetRange:\s*(.*)$/) {
+						$rec{'netRange'} = $1;
+
+						my ($network, $enetrange) = ($1 =~ /^(\d+\.\d+\.\d+\.\d+)\s+-\s+(\d+\.\d+\.\d+\.\d+).*$/);
+				#		print "found network $network from ". $rec{'netRange'} ."\n";
+						if(defined($network)) {
+							$rec{'network'} = $network;
+						}
+						if(defined($enetrange)) {
+							$rec{'enetrange'} = $enetrange;
+						}
+						
+						
+					}
+					elsif($nextline =~ /^\s*NetType:\s*(.*)$/) {
+						if($1 eq 'assignment') {
+							$rec{'netType'} = 1;
+						}
+						elsif($1 eq 'reassignment') {
+							$rec{'netType'} = 2;
+						}
+						elsif($1 eq 'rir') {
+							$rec{'netType'} = 3;
+						}
+						elsif($1 eq 'allocation') {
+							$rec{'netType'} = 4;
+						}
+						else {
+							$rec{'netType'} = 0;
+						}
+					}
+					elsif($nextline =~ /^\s*RegDate:\s*(.*)$/) {
+						if($1 ne '') {
+							$rec{'registerDate'} = $1;
+						}
+						else {
+							$rec{'registerDate'} = '1970-01-01';
+						}
+					}
+					elsif($nextline =~ /^\s*Updated:\s*(.*)$/) {
+						$rec{'updateDate'} = $1;
+					}
+					elsif($nextline =~ /^\s*NameServer:\s*(.*)$/) {
+						$rec{"nameserver$nnameserver"} = $1;
+						$nnameserver++;
+					}
+					elsif($nextline =~ /^\s*Comment:\s*(.*)$/) {
+						$rec{'comment'} = $1 if $ncomment == 0;
+						$rec{'comment'} .= " ". $1 if $ncomment > 0;
+						$ncomment++;
+					}
+					elsif(lc($nextline) =~ /^\s*source:\s*(.*)$/) {
+						$rec{'source_string'} = $1;
+				        $rec{'source'} = $sources{lc($1)};
+                        if($rec{'source'} < 1) { 
+                            $rec{'source'} = 0;
+                  		}
+						$found_source = 1;
+					}
+					elsif($nextline =~ /^\s*TechHandle:\s*(.*)$/) {
+						$rec{'techHandle'} = $1;
+					}
+
+					# advance to the next line
+					$nextline = <INPUT>;
+					$lineno++;
+		#			print "reading next line: $nextline";
+				}
+				if($found_net and !$found_source) { # bad data.  Deal with by trying again until we find the source line
+					goto NET_TRY_AGAIN;
+				}
+
+				$record++;
+
+				$log->log(level=>'error', message=>"ERROR: Record data not parsed properly for last nethandle (line# $lineno)\n") if !defined($rec{'netHandle'});
+
+                $another_source = 0;
+                if($sources{lc($rec{'orgId'})} > 0) {
+                    $another_source = 1;
+                    $log->log(level=>'debug', message=>"NetHandle: " . $rec{'netHandle'} . ", OrgID: " . $rec{'orgId'} . ". skipped\n");
+                }
+
+				my $found_record=0;
+                if(defined($rec{'netHandle'}) and !$skipNet and !$another_source) {
+					# update/insert into database
+					 $select_from_netblock_by_nethandle_sth->execute($rec{'netHandle'}) or die "Can't select record: $DBI::errstr";;
+					 while(my($id, $org_id_1) = $select_from_netblock_by_nethandle_sth->fetchrow_array()) {
+						$found_record=1;
+						$record_id = $id;
+					 }
+
+					 $select_from_netblock_by_nethandle_sth->finish();
+
+$rec{'comment'} = substr($rec{'comment'}, 0, $fields_length{'netblock.comment'});
+					 if($found_record) {
+
+						$log->log(level=>'debug', message=>"Found NetHandle record: ". $rec{'netHandle'} ." in database -- updating id=". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$update_netblock_sth->execute($rec{'netHandle'}, $rec{'orgId'}, $rec{'parent'},
+												      $rec{'netName'}, $rec{'netRange'}, ipv4_quaddot_to_decimal($rec{'network'}), ipv4_quaddot_to_decimal($rec{'enetrange'}), $rec{'netType'},
+													  $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+													  $rec{'nameserver1'}, $rec{'nameserver2'}, $rec{'nameserver3'}, $rec{'nameserver4'},
+													  $rec{'nocHandle'}, $rec{'abuseHandle'}, $rec{'techHandle'}, $rec{'source'}, $cacheDate,
+													  $record_id)
+								or die "Can't select record: $DBI::errstr";
+						$update_netblock_sth->finish();
+					 }
+					 else {
+						$log->log(level=>'debug', message=>"Found NetHandle record: ". $rec{'netHandle'} ." but not in database -- inserting ...\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$insert_into_netblock_sth->execute($rec{'netHandle'}, $rec{'orgId'}, $rec{'parent'},
+												           $rec{'netName'}, $rec{'netRange'}, ipv4_quaddot_to_decimal($rec{'network'}), ipv4_quaddot_to_decimal($rec{'enetrange'}), $rec{'netType'},
+													       $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+													       $rec{'nameserver1'}, $rec{'nameserver2'}, $rec{'nameserver3'}, $rec{'nameserver4'},
+													       $rec{'nocHandle'}, $rec{'abuseHandle'}, $rec{'techHandle'}, $rec{'source'},
+														   $cacheDate, $cacheDate)
+								or die "Can't select record: $DBI::errstr";
+
+						$insert_into_netblock_sth->finish();
+					 }
+				}
+
+				$log->log(level=>"info", message=>"$record NetHandle records processed from $lineno lines\n") if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+				# commit the records to the database every N records
+				if(!defined($opt{'display-only'}) and $record % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+					$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+				}
+			}
+			elsif($_ =~ /^\s*OrgID:/ and !$found_asn and !$found_net and !$found_poc)			# make sure we didn't find the OrgID inside a ASN or Net record
+			{
+				$found_org = 1;
+				my $found_source = 0;
+				# parse org information
+				%rec = ();
+				my $nextline = $_;
+				
+				ORG_TRY_AGAIN:
+				
+				#print "found org handle, parsing.  $nextline";
+				while($nextline =~ /^\s*[A-z0-9\\\/]+.*$/) {
+
+				#	print "found parsing nextline:  $nextline";
+
+					if($nextline =~ /^\s*OrgID:\s+(.*)$/) {
+						$rec{'orgId'} = $1;
+					}
+					elsif($nextline =~ /^\s*OrgName:\s+(.*)$/) {
+						$rec{'orgName'} = $1;
+						# truncate if necessary
+						$rec{'orgName'} = substr($1, 0, 127) if(length($1) > 128);
+					}
+					elsif($nextline =~ /^\s*CanAllocate:\s*(.*)$/) {
+						if($1 eq 'Y') {
+							$rec{'canAllocate'} = 1;
+						}
+						else {
+							$rec{'canAllocate'} = 0;
+						}
+					}
+					elsif($nextline =~ /^\s*Street:\s*(.*)$/) {
+						$rec{"street$nstreet"} = $1;
+						$nstreet++;
+					}
+					elsif($nextline =~ /^\s*City:\s*(.*)$/) {
+						$rec{'city'} = $1
+					}
+					elsif($nextline =~ /^\s*State\/Prov:\s*(.*)$/) {
+						$rec{'state'} = $1;
+					}
+					elsif($nextline =~ /^\s*Country:\s*(.*)$/) {
+						$rec{'country'} = $1;
+					}
+					elsif($nextline =~ /^\s*PostalCode:\s*(.*)$/) {
+						$rec{'postalCode'} = $1;
+					}
+					elsif($nextline =~ /^\s*RegDate:\s*(.*)$/) {
+						if($1 ne '') {
+							$rec{'registerDate'} = $1;
+						}
+						else {
+							$rec{'registerDate'} = '1970-01-01';
+						}
+					}
+					elsif($nextline =~ /^\s*Updated:\s*(.*)$/) {
+						$rec{'updateDate'} = $1;
+					}
+					elsif($nextline =~ /^\s*ReferralServer:\s*(.*)$/) {
+						$rec{'referralServer'} = $1;
+					}
+					elsif($nextline =~ /^\s*Comment:\s*(.*)$/) {
+						$rec{'comment'} = $1 if $ncomment == 0;
+						$rec{'comment'} .= " ". $1 if $ncomment > 0;
+						$ncomment++;
+					}
+					elsif(lc($nextline) =~ /^\s*source:\s*(.*)$/) {
+						$rec{'source_string'} = $1;
+				        $rec{'source'} = $sources{lc($1)};
+                        if($rec{'source'} < 1) { 
+                            $rec{'source'} = 0;
+                  		}
+						$found_source = 1;
+					}
+					elsif($nextline =~ /^\s*OrgAbuseHandle:\s*(.*)$/) {
+						$rec{'abuseHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*OrgAdminHandle:\s*(.*)$/) {
+						$rec{'adminHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*OrgNOCHandle:\s*(.*)$/) {
+						$rec{'nocHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*OrgTechHandle:\s*(.*)$/) {
+						$rec{'techHandle'} = $1;
+					}
+
+					# advance to the next line
+					$nextline = <INPUT>;
+					$lineno++;
+					#print "reading next line: $nextline";
+				}
+				if($found_org and !$found_source) { # bad data.  Deal with by trying again until we find the source line
+					goto ORG_TRY_AGAIN;
+				}
+
+				$record++;
+
+				my $found_record=0;
+				if(defined($rec{'orgName'}) and defined($rec{'orgId'}) and !$skipOrg) {
+					# update/insert into database
+					 $select_from_org_by_orgid_sth->execute($rec{'orgId'}) or die "Can't select record: $DBI::errstr";;
+					 while(my($id) = $select_from_org_by_orgid_sth->fetchrow_array()) {
+						$found_record=1;
+						$record_id = $id;
+					 }
+
+					 $select_from_org_by_orgid_sth->finish();
+
+					 if($found_record) {
+
+						$log->log(level=>'debug', message=>"Found Org record: ". $rec{'orgId'} ." in database -- updating id=". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$update_org_sth->execute($rec{'orgId'}, $rec{'orgName'}, $rec{'canAllocate'},
+												      $rec{'street1'}, $rec{'street2'}, $rec{'street3'}, $rec{'street4'}, $rec{'street5'}, $rec{'street6'},
+													  $rec{'city'}, $rec{'state'}, $rec{'country'}, $rec{'postalCode'}, $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+													  $rec{'referralServer'}, $rec{'adminHandle'}, $rec{'nocHandle'}, $rec{'abuseHandle'}, $rec{'techHandle'},
+													  $rec{'source'}, $cacheDate,
+													  $record_id)
+								or die "Can't select record: $DBI::errstr";
+						$update_org_sth->finish();
+					 }
+					 else {
+						$log->log(level=>'debug', message=>"Found Org record: ". $rec{'orgId'} ." but not in database -- inserting ...\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$insert_into_org_sth->execute($rec{'orgId'}, $rec{'orgName'}, $rec{'canAllocate'},
+												      $rec{'street1'}, $rec{'street2'}, $rec{'street3'}, $rec{'street4'}, $rec{'street5'}, $rec{'street6'},
+													  $rec{'city'}, $rec{'state'}, $rec{'country'}, $rec{'postalCode'}, $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+													  $rec{'referralServer'}, $rec{'adminHandle'}, $rec{'nocHandle'}, $rec{'abuseHandle'}, $rec{'techHandle'},
+													  $rec{'source'}, $cacheDate, $cacheDate) or die "Can't select record: $DBI::errstr";
+
+						$insert_into_org_sth->finish();
+					 }
+				}
+				else {
+					$log->log(level=>'error', message=>"ERROR: Record data not parsed properly for last org (line# $lineno)\n");
+				}
+
+				$log->log(level=>"info", message=>"$record Org records processed from $lineno lines\n") if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+				# commit the records to the database every N records
+				if(!defined($opt{'display-only'}) and $record % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+					$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+				}
+			}
+			elsif($_ =~ /^\s*POCHandle:/)
+			{
+				$found_poc = 1;
+				my $found_source = 0;
+				# parse poc information
+				%rec = ();
+				my $nextline = $_;
+				
+				POC_TRY_AGAIN:
+				
+				#print "found POC handle, parsing.  $nextline";
+				while($nextline =~ /^\s*[A-z\\\/]+[\:\-].*$/) {
+					if($nextline =~ /^\s*POCHandle:\s+([A-z0-9\-()]+)$/) {
+						$rec{'pocHandle'} = $1;
+					}
+					elsif($nextline =~ /^\s*IsRole:\s+(.*)$/) {
+						if($1 eq 'Y') {
+							$rec{'isRole'} = 1;
+						}
+						else {
+							$rec{'isRole'} = 0;
+						}
+					}
+					elsif($nextline =~ /^\s*FirstName:\s*(.*)$/) {
+						$rec{'firstName'} = $1;
+					}
+					elsif($nextline =~ /^\s*LastName:\s*(.*)$/) {
+						$rec{'lastName'} = $1;
+					}
+					elsif($nextline =~ /^\s*MiddleName:\s*(.*)$/) {
+						$rec{'middleName'} = $1;
+					}
+					elsif($nextline =~ /^\s*RoleName:\s*(.*)$/) {
+						$rec{'roleName'} = $1;
+					}
+					elsif($nextline =~ /^\s*Street:\s*(.*)$/) {
+						$rec{"street$nstreet"} = $1;
+						$rec{"street$nstreet"} = substr($1, 0, 127) if(length($1) > 128);
+						$nstreet++;
+					}
+					elsif($nextline =~ /^\s*City:\s*(.*)$/) {
+						$rec{'city'} = $1
+					}
+					elsif($nextline =~ /^\s*State\/Prov:\s*(.*)$/) {
+						$rec{'state'} = $1
+					}
+					elsif($nextline =~ /^\s*Country:\s*(.*)$/) {
+						$rec{'country'} = $1;
+					}
+					elsif($nextline =~ /^\s*PostalCode:\s*(.*)$/) {
+						$rec{'postalCode'} = $1;
+					}
+					elsif($nextline =~ /^\s*RegDate:\s*(.*)$/) {
+						if($1 ne '') {
+							$rec{'registerDate'} = $1;
+						}
+						else {
+							$rec{'registerDate'} = '1970-01-01';
+						}
+					}
+					elsif($nextline =~ /^\s*Updated:\s*(.*)$/) {
+						$rec{'updateDate'} = $1;
+					}
+					elsif($nextline =~ /^\s*Mailbox:\s*(.*)$/) {
+						$rec{'mailbox'} = $1;
+					}
+					elsif($nextline =~ /^\s*OfficePhone:\s*(.*)$/) {
+						$rec{'officePhone'} = $1;
+					}
+					elsif($nextline =~ /^\s*Comment:\s*(.*)$/) {
+						$rec{'comment'} = $1 if $ncomment == 0;
+						$rec{'comment'} .= " ". $1 if $ncomment > 0;
+						$ncomment++;
+					}
+					elsif(lc($nextline) =~ /^\s*source:\s*(.*)$/) {
+						$rec{'source_string'} = $1;
+				        $rec{'source'} = $sources{lc($1)};
+                        if($rec{'source'} < 1) { 
+                            $rec{'source'} = 0;
+                  		}
+						$found_source = 1;
+					}
+					# advance to the next line
+					$nextline = <INPUT>;
+					$lineno++;
+		#			print "reading next line: $nextline";
+				}
+				if($found_poc and !$found_source) { # bad data.  Deal with by trying again until we find the source line
+					goto POC_TRY_AGAIN;
+				}
+
+				$record++;
+
+				$log->log(level=>'error', message=>"ERROR: Record data not parsed properly for last POC (line# $lineno)\n") if !defined($rec{'pocHandle'});
+
+                $another_source = 0;
+                if($sources{lc($rec{'orgId'})} > 0) {
+                    $another_source = 1;
+                    $log->log(level=>'debug', message=>"POCHandle: " . $rec{'pocHandle'} . ", OrgID: " . $rec{'orgId'} . ". skipped\n");
+                }
+
+				my $found_record=0;
+                if(defined($rec{'pocHandle'}) and !$skipPOC and !$another_source) {
+					# update/insert into database
+					 $select_from_poc_by_pochandle_sth->execute($rec{'pocHandle'}) or die "Can't select record: $DBI::errstr";;
+					 while(my($id) = $select_from_poc_by_pochandle_sth->fetchrow_array()) {
+						$found_record=1;
+						$record_id = $id;
+					 }
+
+					 $select_from_poc_by_pochandle_sth->finish();
+
+					 if($found_record) {
+
+						$log->log(level=>'debug', message=>"Found POC record: ". $rec{'pocHandle'} ." in database -- updating id=". $record_id ."\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$update_poc_sth->execute($rec{'pocHandle'}, $rec{'isRole'}, $rec{'firstName'}, $rec{'lastName'}, $rec{'middleName'}, $rec{'roleName'},
+												 $rec{'street1'}, $rec{'street2'}, $rec{'street3'}, $rec{'street4'}, $rec{'street5'}, $rec{'street6'},
+												 $rec{'city'}, $rec{'state'}, $rec{'country'}, $rec{'postalCode'}, $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+												 $rec{'officePhone'}, $rec{'mailbox'}, $rec{'source'}, $cacheDate,
+												 $record_id)
+								or die "Can't select record: $DBI::errstr";
+						$update_poc_sth->finish();
+					 }
+					 else {
+						$log->log(level=>'debug', message=>"Found POC record: ". $rec{'pocHandle'} ." but not in database -- inserting ...\n") if $DEBUG eq 'true' and $opt{verbose} >= 2;
+						$insert_into_poc_sth->execute($rec{'pocHandle'}, $rec{'isRole'}, $rec{'firstName'}, $rec{'lastName'}, $rec{'middleName'}, $rec{'roleName'},
+												      $rec{'street1'}, $rec{'street2'}, $rec{'street3'}, $rec{'street4'}, $rec{'street5'}, $rec{'street6'},
+												      $rec{'city'}, $rec{'state'}, $rec{'country'}, $rec{'postalCode'}, $rec{'registerDate'}, $rec{'comment'}, $rec{'updateDate'},
+												      $rec{'officePhone'}, $rec{'mailbox'}, $rec{'source'}, $cacheDate, $cacheDate) or die "Can't select record: $DBI::errstr";
+
+						$insert_into_poc_sth->finish();
+					 }
+				}
+
+				$log->log(level=>"info", message=>"$record POC records processed from $lineno lines\n") if $opt{'verbose'} >= 1 and $lineno % $DEFAULT_RECORD_DISPLAY_CHUNK_SIZE == 0;
+
+				# commit the records to the database every N records
+				if(!defined($opt{'display-only'}) and $record % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0) {
+					$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+				}
+			} # end if parser
+		} # end while
+
+		# commit one last time
+		if(!defined($opt{'display-only'})) {
+			$update_netblock_expired_sth->execute($src,$cacheDate) or warn "Can't update netblock records: $DBI::errstr";
+			$update_netblock_expired_sth->finish();
+			$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+		}
+
+	} # end if
+}
+
+sub getDateTimeFormat {
+	my $current = shift;
+	if(!defined($current)) {
+			$current = time();
+	}
+	return POSIX::strftime("%b %d %Y %H:%M:%S %Z", gmtime($current));
+}
+
+sub resolve_hostname($)
+{
+  	my $hostname = shift;
+  	use Net::DNS;
+  	my $res   = Net::DNS::Resolver->new;
+  	my $query = $res->search($hostname);
+	my $c =0;
+	my $addr;
+   	if ($query)
+	{
+        	foreach my $rr ($query->answer)
+		{
+			next unless $rr->type eq "A";
+			$addr = $rr->address if $c == 0;
+			$c++;
+		}
+	}
+	else
+	{
+		$addr = 'no address';
+	}
+	return $addr;
+}
+
+
+# convert quaddot to decimal integer
+sub ipv4_quaddot_to_decimal($) {
+	my $ip = shift;
+	warn "invalid ip address provided" if !defined($ip);
+	return -1 if !defined($ip);
+	warn "invalid ip address provided: $ip" if(! $ip =~ /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/);
+	return "" if(! $ip =~ /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/);
+
+	return unpack "N", pack "CCCC", split /\./, $ip;
+}
+
+# convert decimal integer to quaddot
+sub ipv4_decimal_to_quaddot($) {
+	my $decimal = shift;
+	warn "invalid decimal value provided" if !defined($decimal);
+	return "" if !defined($decimal);
+
+	warn "invalid decimal value provided: $decimal" if($decimal < 0 or $decimal > 4294967295);
+	return "" if($decimal < 0 or $decimal > 4294967295);
+        return join ".", unpack "CCCC", pack "N", $decimal;
+}
+
+my $ip_rgx = "\\d+\\.\\d+\\.\\d+\\.\\d+";
+
+# Given an IPv4 address in host, ip/netmask or cidr format
+# returns a ip / cidr pair.
+sub ipv4_parse($;$) {
+  my ($ip,$msk);
+  # Called with 2 args, assume first is IP address
+  if ( defined $_[1] ) {
+    $ip = $_[0];
+    $msk= $_[1];
+  } else {
+    ($ip)  = $_[0] =~ /($ip_rgx)/o;
+    ($msk) = $_[0] =~ m!/(.+)!o;
+  }
+
+  # Remove white spaces
+  $msk =~ s/\s//g if defined $msk;
+
+  # Check Netmask to see if it is a CIDR or Network
+  if (defined $msk ) {
+    if ($msk =~ /^\d{1,2}$/) {
+      # Check cidr
+      warn ": invalid cidr: ". $msk ."\n"
+        if $msk < 0 or $msk > 32;
+    } elsif ($msk =~ /^$ip_rgx$/o ) {
+      $msk = ipv4_msk2cidr($msk);
+    } else {
+      warn ": invalid netmask specification: ". $msk ."\n";
+    }
+  } else {
+    # Host
+    return $ip;
+  }
+  wantarray ? ($ip,$msk) : "$ip/$msk";
+}
+
+sub ipv4_dflt_netmask($) {
+  my ($ip) = ipv4_parse($_[0]);
+
+  my ($b1) = split /\./, $ip;
+
+  return "255.0.0.0"	if $b1 <= 127;
+  return "255.255.0.0"	if $b1 <= 191;
+  return "255.255.255.0";
+}
+
+# Transform a netmask in a CIDR mask length
+sub ipv4_msk2cidr($) {
+  my $msk = $_[0];
+  my @bytes = split /\./, $msk;
+  my $cidr = 0;
+  for (@bytes) {
+    my $bits = unpack( "B*", pack( "C", $_ ) );
+    $cidr +=  $bits =~ tr /1/1/;
+  }
+  return $cidr;
+}
+
+# take and IPv4 range and transform to cidr
+sub ipv4_netrange2cidr($;$)
+{
+	my ($begip, $endip) = @_;
+	my $msk;
+	my $i;
+	my $r;
+
+	my @b = (0, 0, 0, 0);
+	my @e = (0, 0, 0, 0);
+	my $bn = unpack "N", pack "CCCC", split /\./, $begip;
+	my $en = unpack "N", pack "CCCC", split /\./, $endip;
+	
+	$b[0] = ($bn >> 24) & 0xFF;
+	$b[1] = ($bn >> 16) & 0xFF;
+	$b[2] = ($bn >> 8) & 0xFF;
+	$b[3] = $bn & 0xFF;
+	$e[0] = ($en >> 24) & 0xFF;
+	$e[1] = ($en >> 16) & 0xFF;
+	$e[2] = ($en >> 8) & 0xFF;
+	$e[3] = $en & 0xFF;
+
+    for($r=0, $i=0 ;$i < 4; $i++)
+    {
+        if($b[$i]==$e[$i]) {
+            $r += 8;
+		}
+        else
+        {
+            for($msk=0x0080; $msk && ($b[$i] & $msk) == ($e[$i] & $msk); $msk >>= 1) {
+                $r++;
+			}
+            last;
+        }
+    }
+	return $r;
+}
+
+
+# ------------------------------------------------------------------------
+# **************  MRT dump parsing function  *****************************
+# ------------------------------------------------------------------------
+
+my @BGP_routes = (); # the BGP routes array
+
+sub notnull {
+    return (($_[0]) && ($_[0] ne "\0\0\0\0")) ? 1 : 0;
+}
+
+sub pretty_as {
+    my ($as_hi, $as_lo) = unpack('nn', $_[0]);
+    return defined $as_lo ? ($as_hi ? "$as_hi.$as_lo" : $as_lo) : $as_hi;
+}
+
+sub inet_ntoa
+{
+    join('.', unpack('C4', $_[0]));
+}
+
+sub inet6_ntoa
+{
+    local $_ = sprintf("%0*v2x", ':', $_[0]);
+    s/(..):(..)/${1}${2}/g;
+    s/(:0000)+$/::/;
+    return '::' if $_ eq '0000::';
+    return $_;
+}
+
+sub print_aspath {
+    my ($aspath) = @_;
+    my $s = '';
+
+    return $s if(!defined($aspath));
+
+    foreach(@$aspath){
+        # 1 AS_SET  2 AS_SEQUENCE  3 AS_CONFED_SEQUENCE  4 AS_CONFED_SET
+        my ($type, $segment) = @$_;
+        my $s1 = $type == 1 ? '{' : '';
+        my $s2 = $type == 1 ? '}' : '';
+        my $s3 = $type == 1 ? ',' : ' ';
+        $s .= " $s1" . join($s3, map { pretty_as($_) } @$segment) . $s2;
+    }
+    $s =~ s/^[[:space:]]+//;
+    return $s;
+}
+
+# ------------------------------------------------------------------------
+#  parse BGP attributes
+#
+#  paremeters: buffer, AS size
+#
+#  return zero if all ok and ___ on attributes
+# ------------------------------------------------------------------------
+sub parse_attributes
+{
+    my $retcode = 0;
+    my ($buff, $as_size) = @_;
+    my $attr;
+    my $flags;
+    my $type;
+    my @attrs;
+
+    return (-1, \@attrs) if(!defined($buff));
+
+    $as_size = 2 if(!defined($as_size));
+
+    while(2 < length($buff)) # there have to be attr.type (two octets), attr.lenght (one or two octets)
+    {
+        ($flags, $type, $buff) = unpack("C C a*", $buff);
+
+        if($flags & 0x80){
+            # print "optional flag set\n";
+            #$log->log(level=>'debug', message=>"optional flag set \n");
+        }
+        if($flags & 0x40){
+            # print "transitive flag set\n";
+            #$log->log(level=>'debug', message=>"transitive flag set \n");
+        }
+        if($flags & 0x20){
+            # print "partial flag set\n";
+            #$log->log(level=>'debug', message=>"partial flag set \n");
+        }
+
+        if($flags & 0x10){
+            #print "extended length flag set\n";
+            #$log->log(level=>'debug', message=>"extended length flag set \n");
+            ($attr, $buff) = unpack("n/a a*", $buff);
+        }
+        else{
+            #print "extended length flag not set\n";
+            ($attr, $buff) = unpack("C/a a*", $buff);
+        }
+
+        if(1 == $type){
+            # ORIGIN: 0 - IGP, 1 - EGP, 2 - INCOMPLETE
+            $attrs[$type] = unpack('C', $attr);
+        }
+        elsif(2 == $type){
+            # AS_PATH: a sequence of AS path segments. each segment is <path segment type, path length, path segment value>
+            my ($seg_type, $seg_len, $seg_val);
+            $attrs[$type] = [ ];
+            while(3 < length($attr)) # seg.type (one octet), seg_len (one) and seg_data (one at lest)
+            {
+                ($seg_type, $seg_len, $attr) = unpack("C C a*", $attr);
+                # what about length control? (2 * seg_len) should be less or equal length($attr)
+                $seg_val = substr($attr, 0, $as_size*$seg_len, "");
+                push(@{$attrs[$type]}, [$seg_type, [unpack("(a$as_size)*", $seg_val)]]);
+            }
+        }
+        elsif(3 == $type){
+            # NEXT_HOP: defines an ip-address of border route that should be used as next hop
+            $attrs[$type] = $attr;
+        }
+        elsif(4 == $type){
+            # MULTI_EXIT_DISC: four octet non-negative integer
+            $attrs[$type] = $attr;
+        }
+        elsif(5 == $type){
+            # LOCAL_PREF: four octet non-negative integer
+            $attrs[$type] = $attr;
+        }
+        elsif(6 == $type){
+            # ATOMIC_AGGREGATE: length 0,
+            $attrs[$type] = 1;
+        }
+        elsif(7 == $type){
+            # AGGREGATOR: length 6, last AS number and IP-address of BGP speaker
+            $attrs[$type] = [unpack('a2 a4', $attr)];
+        }
+        elsif(8 == $type){
+            # COMMUNITIES:
+            $attrs[$type] = [ ];
+            while(length($attr) > 0){
+                my $community = substr($attr, 0, 4, "");
+                push(@{$attrs[$type]}, $community);
+            }
+        }
+        else{
+            # what about BGP_ATTR_ORIGINATOR_ID, BGP_ATTR_CLUSTER_LIST, BGP_ATTR_DPA, BGP_ATTR_ADVERTISER,
+            # BGP_ATTR_RCID_PATH, BGP_ATTR_MP_REACH_NLRI, BGP_ATTR_MP_UNREACH_NLRI, BGP_ATTR_EXT_COMMUNITIES
+            # attributes?
+            #
+            $log->log(level=>'warning', message=>"unknown attribute $type (flags: $flags, length: " . length($attr) . "\n");
+        }
+    }
+
+    return ($retcode, \@attrs);
+}
+#BGP_ATTR_ORIGIN                 1
+#BGP_ATTR_AS_PATH                2
+#BGP_ATTR_NEXT_HOP               3
+#BGP_ATTR_MULTI_EXIT_DISC        4
+#BGP_ATTR_LOCAL_PREF             5
+#BGP_ATTR_ATOMIC_AGGREGATE       6
+#BGP_ATTR_AGGREGATOR             7
+#BGP_ATTR_COMMUNITIES            8
+##       BGP_ATTR_ORIGINATOR_ID  9
+##       BGP_ATTR_CLUSTER_LIST   10
+###      BGP_ATTR_DPA            11
+##       BGP_ATTR_ADVERTISER     12
+###      BGP_ATTR_RCID_PATH      13
+#BGP_ATTR_MP_REACH_NLRI          14
+#BGP_ATTR_MP_UNREACH_NLRI        15
+#BGP_ATTR_EXT_COMMUNITIES        16
+
+# ------------------------------------------------------------------------
+# define best route
+#
+# parameters:
+#
+# return: 1 for best route 0 for net
+#
+# ------------------------------------------------------------------------
+sub get_best_route
+{
+    my ($network, $cidr) = @_;
+    my $id;
+    my $num;
+    my $br = 0;
+    my $sth;
+    my $sth_br;
+
+    return 0 if(!(defined($network) && defined($cidr)));
+
+    if((( 8 == $cidr) && ($network < 0x80000000)) ||                              # A-class network
+       ((16 == $cidr) && (0x80000000 <= $network) && ($network < 0xC0000000)) ||  # B-class network
+       ((24 == $cidr) && (0xC0000000 <= $network) && ($network < 0xE0000000)))    # C-class network
+    {
+        $sth = $select_from_bgp_routes_number_of_routes_class;
+        $sth_br = $select_from_bgp_routes_best_route_class;
+    }
+    else{
+        $sth = $select_from_bgp_routes_number_of_routes;
+        $sth_br = $select_from_bgp_routes_best_route;
+    }
+    $sth->execute($network, $cidr) or die "could not select from bgp_routes: $DBI::errstr";;
+    $num = $sth->fetchrow_array();
+    $log->log(level=>'debug', message=>"network: $network, cidr: $cidr --- num: $num \n");
+    if(1.0 > rand($num + 1)){
+        $sth_br->execute($network, $cidr) or die "could not select from bgp_routes: $DBI::errstr";;
+        while($id = $sth_br->fetchrow_array()){
+            my $j1 = 0;
+            $update_bgp_routes_set_best_route->execute(0, $id) or die "could not update record: $DBI::errstr";;
+            $update_bgp_routes_set_best_route->finish();
+            $log->log(level=>'error', message=>"Error: number of best route is $j1! network: $network/$cidr\n") if($j1 > 0);
+            $j1++;
+        }
+        $sth_br->finish();
+        $br = 1;
+    }
+    $sth->finish();
+
+    $dbh->commit();
+
+    return $br;
+}
+
+# ------------------------------------------------------------------------
+# Insert a record into bgp_routes tables
+#
+# parameters: router_id, network, cidr, next_hop, asn, as_path, originate time, modify date
+#
+# return zero if no error
+# ------------------------------------------------------------------------
+sub insertBGPRouteIntoDB
+{
+    my $rc = 0;
+    my ($rID, $net, $cidr, $nhop, $asn, $as_path, $orig_time, $modifyDate) = @_;
+    my $id;
+    my $found = 0;
+    my $best_route = 0;
+
+    return -1 if(!(defined($rID) && defined($net) && defined($cidr) && defined($nhop) &&
+                   defined($asn) && defined($as_path) && defined($orig_time)));
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    # check the record already exists in database
+    $select_from_bgp_routes_by_prefix_sth->execute($net, $cidr, $nhop, $rID)
+                                                   or die "could not update record: $DBI::errstr";
+
+    $found = 1 if($id = $select_from_bgp_routes_by_prefix_sth->fetchrow_array());
+
+    $select_from_bgp_routes_by_prefix_sth->finish();
+
+    $best_route = get_best_route($net, $cidr);
+
+    if(1 == $found){
+        $update_bgp_routes_sth->execute($asn, $as_path, $modifyDate, $best_route, $id)
+                                or die "could not update record: $DBI::errstr";
+        $update_bgp_routes_sth->finish();
+    }
+    else{
+        $insert_into_bgp_routes_sth->execute($rID, $net, $cidr, $nhop, $asn, $as_path,
+                                             $orig_time, $modifyDate, 1, $best_route)
+                                             or die "could not insert record: $DBI::errstr";
+        #
+        # The Status octet is not used in the TABLE_DUMP Type and SHOULD be set to 1
+        # (http://tools.ietf.org/html/draft-ietf-grow-mrt-08)
+        #
+        $insert_into_bgp_routes_sth->finish();
+    }
+
+    return 0;
+}
+
+# ------------------------------------------------------------------------
+# Insert BGP routes aray into table bgp_routes
+#
+# parameters: none
+#
+# return zero if no error
+# ------------------------------------------------------------------------
+sub BGP_routes_insert
+{
+    my $rc = 0;
+    my $j1 = int(rand($#BGP_routes + 1));
+    my $found = 0;
+    my $id;
+
+    #printf("network: 0x%08X/%d, number: %d \n",
+    #       $bgp_routes_array[0]->{"network"}, $bgp_routes_array[0]->{"cidr"}, $#bgp_routes_array);
+
+    $BGP_routes[$j1]->{'best_route'} = 1;
+
+    for(@BGP_routes){
+        my $route = $_;
+
+        $select_from_bgp_routes_by_prefix_sth->execute($route->{'network'}, $route->{'cidr'},
+                                                       $route->{'next_hop'}, $route->{'router_id'})
+                                                       or die "could not select from bgp_routes: $DBI::errstr \n";
+        $found = 1 if($id = $select_from_bgp_routes_by_prefix_sth->fetchrow_array());
+        $select_from_bgp_routes_by_prefix_sth->finish();
+
+        if(1 == $found){
+            $update_bgp_routes_sth->execute($route->{'asn'}, $route->{'as_path'}, $route->{'modifydate'},
+                                            $route->{'best_route'}, $id) or die "could not update record: $DBI::errstr \n";
+            $update_bgp_routes_sth->finish();
+        }
+        else{
+            $insert_into_bgp_routes_sth->execute($route->{'router_id'}, $route->{'network'}, $route->{'cidr'},
+                                                 $route->{'next_hop'}, $route->{'asn'}, $route->{'as_path'},
+                                                 $route->{'origtime'}, $route->{'modifydate'}, 1, $route->{'best_route'})
+                                                 or die "could not insert record: $DBI::errstr \n";
+            $insert_into_bgp_routes_sth->finish();
+        }
+    }
+
+    return $rc;
+}
+
+# ------------------------------------------------------------------------
+# insert or update record in BGP_routes array
+#
+# parameters: router_id, network, cidr, next_hop, asn, as_path, originate time, modify date
+#
+# return zero if no error
+# ------------------------------------------------------------------------
+sub insertRecordInBGPRoutes
+{
+    my $rc = 0;
+    my ($rID, $net, $cidr, $nhop, $asn, $as_path, $orig_time, $modifyDate) = @_;
+    my %record = [];
+
+    return -1 if(!(defined($rID) && defined($net) && defined($cidr) && defined($nhop) &&
+                   defined($asn) && defined($as_path) && defined($orig_time)));
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    $record{'router_id'}  = $rID;
+    $record{'network'}    = $net;
+    $record{'cidr'}       = $cidr;
+    $record{'next_hop'}   = $nhop;
+    $record{'asn'}        = $asn;
+    $record{'as_path'}    = $as_path;
+    $record{'origtime'}   = $orig_time;
+    $record{'modifydate'} = $modifyDate;
+    $record{'best_route'} = 0;
+
+    if(0 > $#BGP_routes){
+        $BGP_routes[0] = \%record;
+    }
+    elsif(($net == $BGP_routes[0]->{'network'}) && ($cidr == $BGP_routes[0]->{'cidr'})){
+        $BGP_routes[$#BGP_routes + 1] = \%record;
+    }
+    elsif(($net > $BGP_routes[0]->{'network'}) ||
+          (($net == $BGP_routes[0]->{'network'}) && ($cidr > $BGP_routes[0]->{'cidr'})))
+    {
+        $log->log(level=>'debug', message=>"dump routes into database \n");
+        BGP_routes_insert();
+        @BGP_routes = ();
+        $BGP_routes[0] = \%record;
+    }
+    else{
+        $log->log(level=>'warning',
+                  message=>"WARNING! the network ($record{'network'}) is less then previous network " .
+                           "($BGP_routes[0]->{'network'}) or \nnetworks is equal but cidr ($record{'cidr'})" .
+                           " is less then the previous one ($BGP_routes[0]->{'cidr'})\n" .
+                           "record was skipped\n");
+    }
+
+    return $rc;
+}
+
+# ------------------------------------------------------------------------
+#  parse TABLE_DUMP_IPv4 record
+#
+#  parameters: buffer, length of buffer, 1 if IPv4 2 if IPv6
+#
+#  return: zero if no error
+#
+# ------------------------------------------------------------------------
+sub parse_TABLE_DUMP_IPv4
+{
+    my $rc = 0;
+    my ($buff, $len, $subtype, $modifyDate) = @_;
+    my $vnum;               # view number
+    my $seqnum;             # sequence number
+    my $prefix;             # prefix
+    my $prefix_len;         # prefix length
+    my $status;             # status
+    my $orig_time;          # originated time
+    my $peer_ip;            # peer ip address
+    my $peer_as;            # peer AS
+    my $attr_len;           # attribute length
+    my $attr;               # string of attributes
+    my $best_route = 0;     # best route
+    my $attrs;
+
+    my $found = 0;
+    my $record_id = -1;
+    my $sth;
+    my @tmp_arr;
+    my $asn;
+    my $as_path;
+
+    return -1 if(!(defined($buff) && defined($len) && defined($subtype)));
+
+    return 1 if(2 == $subtype); # skip IPv6 records
+
+    return -2 if(((1 == $subtype) && ($len < 0x16)) || ((2 == $subtype) && ($len < 0x2E)));
+
+    $modifyDate = time() if(!defined($modifyDate));
+    if(1 == $subtype)
+    {
+        ($vnum, $seqnum, $prefix, $prefix_len, $status, $orig_time, $peer_ip, $peer_as, $attr_len, $attr)
+                = unpack("n n a4 C C N a4 n n a*", $buff);
+
+
+        #$log->log(level=>'debug',
+        #          message=>"VIEW: $vnum, SEQUENCE: $seqnum, PREFIX: " . inet_ntoa($prefix) . "/$prefix_len\n" .
+        #                   "status: $status " . "ORIGINATED: " . localtime($orig_time) . "\n");
+        #$log->log(level=>'debug', message=>"FROM: " . inet_ntoa($peer_ip) . " AS $peer_as \n") if($peer_as);
+    }
+    elsif(2 == $subtype)
+    {
+        ($vnum, $seqnum, $prefix, $prefix_len, $status, $orig_time, $peer_ip, $peer_as, $attr_len, $attr)
+                = unpack('n n a16 C C N a16 n n a*', $buff);
+
+        #$log->log(level=>'debug',
+        #          message=>"VIEW: $vnum, SEQUENCE: $seqnum, PREFIX: " . inet6_ntoa($prefix) . "/$prefix_len\n" .
+        #                   "status: $status " . "ORIGINATED: " . localtime($orig_time) . "\n");
+        #$log->log(level=>'debug', message=>"FROM: " . inet6_ntoa($peer_ip) . " AS $peer_as \n") if($peer_as);
+    }
+    #print "record lenght: $len, attribute length: $attr_len\n";
+
+    return -3 if(((1 == $subtype) && (0x16 != $len - $attr_len)) || ((2 == $subtype) && (0x2E != $len - $attr_len)));
+
+    ($rc, $attrs) = parse_attributes($attr);
+
+    return -4 if(0 != $rc);
+
+    $as_path = print_aspath($attrs->[2]);
+    if($fields_length{'bgp_routes.as_path'} < length($as_path)){
+        $log->log(level=>'warning', message=>"WARNING! as_path too long truncated ($as_path)\n");
+        $log->log(level=>'warning',
+                  message=>"VIEW: $vnum, SEQUENCE: $seqnum, PREFIX: " . inet_ntoa($prefix) . "/$prefix_len\n" .
+                           "status: $status " . "ORIGINATED: " . localtime($orig_time) . "\n");
+        $log->log(level=>'warning', message=>"FROM: " . inet_ntoa($peer_ip) . " AS $peer_as \n") if($peer_as);
+        $as_path = substr($as_path, - $fields_length{'bgp_routes.as_path'});
+    }
+    @tmp_arr = split(/\D+/, $as_path);
+    $asn = $tmp_arr[$#tmp_arr];
+    #$log->log(level=>'debug', message=>"asn: $asn; as_path: $as_path\n");
+
+    $asn = $peer_as if(!defined($asn)); # ???
+
+    insertRecordInBGPRoutes(unpack("N", $peer_ip), unpack("N", $prefix), $prefix_len,
+                            unpack("N", $attrs->[3]), $asn, $as_path, $orig_time, $modifyDate);
+
+    return 0;
+}
+
+my @BGP_peers = ();
+
+# ------------------------------------------------------------------------
+#  parse TABLE_DUMP_V2 record, subtype PEER_INDEX_TABLE
+#
+#  parameters: buffer, length of buffer, modify date
+#
+#  return: zero if no error
+# ------------------------------------------------------------------------
+sub parse_TABLE_DUMP_V2_PEER_INDEX_TABLE
+{
+    my $j1 = 0;
+    my $rc = 0;
+    my ($buff, $len, $modifyDate) = @_;
+
+    my $colID;
+    my $viewName;
+    my $count;
+    my $ptype;
+    my $fmt;
+    my $bgp_id;
+    my $peer_ip;
+    my $peer_as;
+
+    return -1 if(!(defined($buff) && defined($len)));
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    ($colID, $viewName, $count, $buff) = unpack("N n/a n a*", $buff);
+
+    $log->log(level=>'debug', message=>"ID: $colID; peer count: $count \n");
+    $log->log(level=>'debug', message=>"view name: $viewName; \n") if(defined($viewName) && length($viewName));
+
+    @BGP_peers = ();
+
+    while(length($buff) > 0){
+        ($ptype, $buff) = unpack("C a*", $buff);
+        $fmt = "N a" . ((0x01 & $ptype) ? "16" : "4") . " a" . ((0x02 & $ptype) ? "4" : "2") . " a*";
+        ($bgp_id, $peer_ip, $peer_as, $buff) = unpack($fmt, $buff);
+        $BGP_peers[$#BGP_peers + 1] = [ $ptype, $bgp_id, $peer_ip, $peer_as ];
+        $j1++;
+    }
+
+    $log->log(level=>'warning', message=>"size of BGP_peers ($j1) is not equal peer count ($count)\n") if($j1 != $count);
+
+    for(@BGP_peers){
+        my $el = $_;
+        my $ip = (0x01 & $el->[0]) ? inet6_ntoa($el->[2]) : inet_ntoa($el->[2]) ;
+        $log->log(level=>'debug', message=>"peer_type: $el->[0], peer_id: $el->[1], peer_ip: $ip, peer_as: AS" .
+                                            pretty_as($el->[3]) . " \n");
+    }
+
+    return $rc;
+}
+
+# ------------------------------------------------------------------------
+#  parse TABLE_DUMP_V2 record, subtypes RIB_IPv4_UNICAT, RIB_IPv4_MULTICAST, RIB_IPv6_UNICAST, RIB_IPv6_MULTICAST
+#
+#  parameters: buffer, length of buffer, subtype, modify date
+#
+#  return: zero if no error
+# ------------------------------------------------------------------------
+sub parse_TABLE_DUMP_V2_RIB_IP
+{
+    my $rc = 0;
+    my ($buff, $len, $subtype, $modifyDate) = @_;
+    my $af;
+    my $seq_num;
+    my $plen;
+    my $prfx;
+    my $ecnt;
+    my $pndx;
+    my $origtime;
+    my $astr;
+    my $attrs;
+
+    my $router_id;
+    my $net;
+    my $next_hop;
+    my $asn;
+    my $as_path;
+    my @tmp_arr;
+
+    return -1 if(!(defined($buff) && defined($len) && defined($subtype)) || ((2 > $subtype) && ($subtype > 5)));
+
+    # skip IPv6 records:
+    return 1 if((4 == $subtype) && (5 == $subtype));
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    $af = (3 >= $subtype) ? 1 : 2; # IPv4 or IPv6
+    ($seq_num, $plen, $buff) = unpack("N C a*", $buff);
+    $rc = int($plen / 8) + (($plen % 8) ? 1 : 0);
+    ($prfx, $ecnt, $buff) = unpack("a$rc n a*", $buff);
+    $prfx .= "\0" x (((2 == $af) ? 16 : 4) - $rc);
+
+    $rc = 0;
+
+    while(length($buff)){
+        ($pndx, $origtime, $astr, $buff) = unpack("n N n/a a*", $buff);
+
+        if($pndx > $#BGP_peers){
+            $log->log(level=>'warning', message=>"WARNING: Peer index ($pndx) is out of range \n");
+        }
+        else{
+            # !!!!!
+            # for IPv4 only!
+            # !!!!!
+            ($rc, $attrs) = parse_attributes($astr, (0x02 & $BGP_peers[$pndx]->[0]) ? 4 : 2);
+            #$router_id = (2 == $af) ? inet6_ntoa($prfx) : inet_ntoa($prfx);
+            ($net) = unpack("N", $prfx);
+            #$net = (0x01 & $BGP_peers[$pndx]->[0]) ? inet6_ntoa($BGP_peers[$pndx]->[2]) : inet_ntoa($BGP_peers[$pndx]->[2]);
+            ($router_id) = unpack("N", $BGP_peers[$pndx]->[2]);
+            #$next_hop = (2 == $af) ? inet6_ntoa($attrs->[3]) : inet_ntoa($attrs->[3]);
+            $next_hop = unpack("N", $attrs->[3]);
+            $as_path = print_aspath($attrs->[2]);
+            if($fields_length{'bgp_routes.as_path'} < length($as_path)){
+                $log->log(level=>'warning', message=>"WARNING! as_path too long truncated ($as_path)\n");
+
+                $as_path = substr($as_path, - $fields_length{'bgp_routes.as_path'});
+            }
+            @tmp_arr = split(/\D+/, $as_path);
+            $asn = $tmp_arr[$#tmp_arr];
+
+            $log->log(level=>'debug', message=>"$router_id, $net/$plen, $next_hop, $asn, $as_path, $origtime \n");
+
+            insertRecordInBGPRoutes($router_id, $net, $plen, $next_hop, $asn, $as_path, $origtime, $modifyDate);
+
+            #my $peer_as = pretty_as($BGP_peers[$pndx]->[3]);
+            #$log->log(level=>'debug', message=>"SUBTYPE: $subtype, sequence: $seq_num \n" .
+            #                                   "prefix: $net/$plen\n" .
+            #                                   "FROM: $router_id AS$peer_as\nAS PATH: " . print_aspath($attrs->[2]) . "\n" .
+            #                                   "NEXTHOP: $next_hop \n");
+            #$log->log(level=>'debug', message=>"FROM != NEXTHOP \n") if(!($ip1 eq $ip2));
+        }
+    }
+
+    return $rc;
+}
+
+# ------------------------------------------------------------------------
+#  parse TABLE_DUMP_V2 record
+#
+#  parameters: buffer, length of buffer, subtype of record, modify date
+#
+#  return: zero if no error
+# ------------------------------------------------------------------------
+sub parse_TABLE_DUMP_V2
+{
+    my $rc = 0;
+    my ($buff, $len, $subtype, $modifyDate) = @_;
+
+    my @str_subtypes = (
+            "unknown",
+            "PEER_INDEX_TABLE",
+            "RIB_IPv4_UNICAST",
+            "RIB_IPv4_MULTICAST",
+            "RIB_IPv6_UNICAST",
+            "RIB_IPv6_MULTICAST",
+            "RIB_GENERIC"
+    );
+
+    return -1 if(!(defined($buff) && defined($len) && defined($subtype)));
+
+    return 1 if((4 == $subtype) || (5 == $subtype)); # skip IPv6 records
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    if(1 == $subtype){
+        # $subtype is 1 --- PEER_INDEX_TABLE
+        $log->log(level=>'debug', message=>"MRT dump, record type is TABLE_DUMP_v2, subtype is PEER_INDEX_TABLE\n");
+        parse_TABLE_DUMP_V2_PEER_INDEX_TABLE($buff, $len, $modifyDate);
+    }
+    elsif((2 <= $subtype) && ($subtype <= 5)){
+        # $subtype is 2 -- 5 --- RIB_IPv4_UNICAST, RIB_IPv4_MULTICAST, RIB_IPv6_UNICAST, RIB_IPv6_MULTICAST
+        $log->log(level=>'debug', message=>"MRT dump, record type is TABLE_DUMP_v2, subtype is $str_subtypes[$subtype]\n");
+        parse_TABLE_DUMP_V2_RIB_IP($buff, $len, $subtype, $modifyDate);
+    }
+    elsif(6 == $subtype){
+        # $subtype is 6 --- RIB_GENERIC
+        $log->log(level=>'debug', message=>"MRT dump, record type is TABLE_DUMP_v2, subtype is RIB_GENERIC\n");
+    }
+    else{
+        $log->log(level=>'warning', message=>"MRT dump, record type is TABLE_DUMP_v2: unknown subtype --- $subtype\n");
+        $rc = -100;
+    }
+
+    return $rc;
+}
+
+# ------------------------------------------------------------------------
+#  read from file and parse MRT format record
+#
+#  parameters: file descriptor, timestamp, type, subtype, record length
+#
+#  return: zero if no error, error code otherwise
+#
+# ------------------------------------------------------------------------
+sub parseMRTRecordFromFile
+{
+    my $retcode = 0;
+    my $fd = $_[0];
+    my $timestamp = $_[1];
+    my $type = $_[2];
+    my $subtype = $_[3];
+    my $reclen = $_[4];
+    my $modifyDate = $_[5];
+    my $buff;
+    my $val;
+
+    return -1 if(!(defined($fd) && defined($timestamp) && defined($type) && defined($subtype) && defined($reclen)));
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    $val = read($fd, $buff, $reclen);
+    if(!defined($val))
+    {
+        #$log->log(level=>'error', "Error reading dump file: $!");
+        $retcode = -1;
+    }
+    elsif($val < $reclen)
+    {
+        #$log->log(level=>'error', "Error reading dump file: read length ($val) less then record size ($reclen), $!");
+        $retcode = -2;
+    }
+    else
+    {
+        # parse record
+
+        # MRT Informational Types
+        if(1 == $type){
+            # START type
+            $log->log(level=>'warning', message=>"START type record\n");
+        }
+        elsif(3 == $type){
+            # I_AM_DEAD type
+            $log->log(level=>'warning', message=>"I_AM_DEAD type record\n");
+        }
+        # MRT Routing Information Type
+        elsif(11 == $type){
+            # OSPF
+            $log->log(level=>'warning', message=>"OSPF type record\n");
+        }
+        elsif(12 == $type){
+            # TABLE_DUMP
+            parse_TABLE_DUMP_IPv4($buff, $val, $subtype, $modifyDate) if(1 == $subtype);
+            $log->log(level=>'warning', message=>"IPv6 protocol not supported yet, skip record\n") if(2 == $subtype);
+        }
+        elsif(13 == $type){
+            # TABLE_DUMP_V2
+            parse_TABLE_DUMP_V2($buff, $val, $subtype, $modifyDate);
+            #$log->log(level=>'warning', message=>"TABLE_DUMP_v2 type record\n");
+        }
+        elsif(16 == $type){
+            # BGP4MP
+            $log->log(level=>'warning', message=>"BGP4MP type record\n");
+        }
+        elsif(17 == $type){
+            # BGP4MP_ET
+            $log->log(level=>'warning', message=>"BGP4MP_ET type record\n");
+        }
+        elsif(32 == $type){
+            # ISIS
+            $log->log(level=>'warning', message=>"ISIS type record\n");
+        }
+        elsif(33 == $type){
+            # ISIS_ET
+            $log->log(level=>'warning', message=>"ISIS_ET type record\n");
+        }
+        elsif(48 == $type){
+            # OSPFv3
+            $log->log(level=>'warning', message=>"OSPFv3 type record\n");
+        }
+        elsif(49 == $type){
+            # OSPFv3_ET
+            $log->log(level=>'warning', message=>"OSPFv3_ET type record\n");
+        }
+    }
+
+    return $retcode;
+}
+
+# ------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------
+sub set_all_status_to_zero
+{
+    my $netstep = 0x10000;
+    my $net1 = 0;
+    my $net2 = $netstep;
+
+    while($net1 < 0xFFFFFFFF){
+        $update_bgp_routes_set_all_routes_inactive->execute($net1, $net2) or die "could not update record: $DBI::errstr";
+        $update_bgp_routes_set_all_routes_inactive->finish();
+        $dbh->commit() or warn "Can't commit records: $DBI::errstr";
+        $net1 = $net2;
+        $net2 += $netstep;
+    }
+}
+
+sub set_all_status_to_zero_with_date
+{
+    my $netstep = 0x10000;
+    my $net1 = 0;
+    my $net2 = $netstep;
+    my $modifyDate = $_[0];
+
+    if(!defined($modifyDate)){
+        $select_maxdate_from_bgp_routes_sth->execute();
+        $modifyDate = $select_maxdate_from_bgp_routes_sth->fetchrow_array();
+        $select_maxdate_from_bgp_routes_sth->finish();
+    }
+
+    $modifyDate = time() if(!defined($modifyDate));
+
+    while($net1 < 0xFFFFFFFF){
+        $update_bgp_routes_set_all_routes_inactive_with_date->execute($net1, $net2, $modifyDate) or die "could not update record: $DBI::errstr";
+        $update_bgp_routes_set_all_routes_inactive_with_date->finish();
+        $dbh->commit() or warn "Can't commit records: $DBI::errstr";
+        $net1 = $net2;
+        $net2 += $netstep;
+    }
+}
+
+# ------------------------------------------------------------------------
+#  parsing MRT format file
+#
+#  parameters: number of record to skip
+#
+#  return: error code and number of processed records
+#
+# ------------------------------------------------------------------------
+sub readMRTdump
+{
+    my $errcode = 0;
+    my $recnum = 0;
+    my ($skip_recnum) = $opt{'skip'};
+    my $fd;
+    my @st;
+    my $DumpFileName;
+    my $filesize;
+    my $pos = 0;
+    my $buff;
+    my $timestamp = 0;
+    my $type = 0;
+    my $subtype = 0;
+    my $reclen = 0;
+    my $rec_header_len = 12;
+    my $rnum;
+    my $modifyDate = time();
+
+    $DumpFileName = $opt{'infile'} if defined $opt{'infile'};
+    return (-1, 0) if !defined($DumpFileName);
+
+    $skip_recnum = 0 if(!defined($skip_recnum));
+
+    #set_all_status_to_zero() if(0 == $skip_recnum);
+
+    open($fd, "<", $DumpFileName) or die "Error open file $DumpFileName: $!";
+    binmode($fd);
+
+    @st = stat($fd);
+
+    if(!defined(@st))
+    {
+        $errcode = -2;
+    }
+    else
+    {
+        $filesize = $st[7];
+
+        while($pos < $filesize) # && $recnum < 10000)
+        {
+            # read record header
+            $rnum = read($fd, $buff, $rec_header_len);
+            if(!defined($rnum))
+            {
+                # read failed, stop processing
+                $log->log(level=>'error', message=>"Error reading file $DumpFileName at position $pos: $!\n");
+                $errcode = -3;
+                $pos = $filesize;
+            }
+            elsif($rnum < $rec_header_len)
+            {
+                # read less than needed, end of file? stop processing
+                $log->log(level=>'error', message=>"Unexpected end of file, pos = $pos\n");
+                $errcode = -4;
+                $pos = $filesize;
+            }
+            else
+            {
+                # ok, let's parse record
+                ($timestamp, $type, $subtype, $reclen) = unpack("NnnN", $buff);
+                $recnum++;
+
+                if($filesize - $pos < $reclen)
+                {
+                    $log->log(level=>'error', message=>"ERROR: file - $DumpFileName, pos - $pos, record length too large: $reclen\n");
+                    $pos = $filesize;
+                    $errcode = -5;
+                }
+                else
+                {
+                    $log->log(level=>'info', message=>"Record: $recnum; position: $pos; record length: $reclen \n");
+                    $pos += 12 + $reclen;
+                    if($recnum > $skip_recnum){
+                        parseMRTRecordFromFile($fd, $timestamp, $type, $subtype, $reclen, $modifyDate);
+                    }
+                    else{
+                        #seek(fd, $reclen, 1);
+                        #seek(fd, $pos, 0);
+                        read($fd, $buff, $reclen);
+                    }
+                }
+            }
+            if(!defined($opt{'display-only'}) and ($recnum % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0)){
+                $log->log(level=>'warning', message=>"commit, number of records: $recnum \n");
+                $dbh->commit() or warn "Can't commit records: $DBI::errstr";
+            }
+        }
+    }
+
+    close($fd);
+
+    $dbh->commit() or warn "Can't commit records: $DBI::errstr";
+    #set_all_status_to_zero_with_date($modifyDate);
+    set_all_status_to_zero_with_date();
+
+    return ($errcode, $recnum);
+}
+
+# ------------------------------------------------------------------------
+# ***********  end of MRT dump parsing function  *************************
+# ------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------
+# **************  RPSL Database parsing function  ************************
+# ------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------
+# parse <record> ... </record>
+#
+# parameters: file descriptor
+#
+# return:
+# ------------------------------------------------------------------------
+sub parseIANAXMLRecord
+{
+    my $fd = $_[0];
+    my $line;
+    my $param;
+    my $prefix;
+    my $whois;
+    my $status;
+
+    return -1 if(!defined($fd));
+
+    while(($line = readline($fd)) && !($line =~ /^[[:space:]]*<\/record>[[:space:]]*$/))
+    {
+        $line = trim_string($line);
+        if(($param) = $line =~ m/^<prefix>(.*)<\/prefix>$/){
+            # network
+            $prefix = trim_string($param);
+        }
+        elsif(($param) = $line =~ m/^<whois>(.*)<\/whois>$/){
+            # whois
+            $whois = lc(trim_string($param));
+        }
+        elsif(($param) = $line =~ m/^<status>(.*)<\/status>$/){
+            # status
+            $status = lc(trim_string($param));
+        }
+    }
+
+    return -1 if(!(defined($prefix) && (defined($whois) || defined($status))));
+
+    my ($ip, $cidr) = split(/\//, $prefix);
+
+    $cidr = int($cidr);
+
+    return -2 if(8 > $cidr);
+
+    $ip = int($ip) << (32 - $cidr);
+
+    $iana_net[$#iana_net + 1] = $ip;
+
+    if(defined($whois)){
+        foreach(%sources){
+            $iana_reg{$ip} = $sources{$_} if($whois =~ $_);
+        }
+    }
+    $iana_reg{$ip} = 1 if(!defined($iana_reg{$ip}));
+
+    $log->log(level=>'info', message=>"ip: $ip, $iana_reg{$ip}\n");
+
+    return 0;
+}
+
+sub defCurrentRegistry
+{
+    my $str = lc($_[0]);
+
+    return 0 if(!defined($str));
+
+    foreach(%sources){
+        return $sources{$_} if($str =~ $_);
+    }
+    return 1;
+}
+
+# ------------------------------------------------------------------------
+# read and parse IANA IPv4 Address Space Registry
+#
+# parameters: xml-file name
+#
+# return:
+# ------------------------------------------------------------------------
+sub parseIANASpaceRegistry
+{
+    my $fd;
+    my $line;
+    my $fname = $_[0];
+
+    return -1 if(!defined($fname));
+
+    open($fd, "<", $fname) or die "Error opening file $fname: $!";
+
+    while($line = readline($fd))
+    {
+        if($line =~ m/^[[:space:]]*<record>[[:space:]]*$/)
+        {
+            parseIANAXMLRecord($fd);
+        }
+    }
+
+    close($fd);
+    @iana_net = sort {$a <=> $b} @iana_net;
+}
+
+# ------------------------------------------------------------------------
+# define the registrator
+#
+# parameters: ip address as integer
+#
+# returns: sources{'REG'}
+# ------------------------------------------------------------------------
+sub getRegistry
+{
+    my $ip = $_[0];
+    my $reg = 0;
+
+    return -1 if(!defined($ip));
+
+    for(@iana_net){
+        if($ip >= $_){
+            $reg = $iana_reg{$_};
+        }
+        else{
+            return $reg;
+        }
+    }
+
+    return 0;
+}
+
+# ------------------------------------------------------------------------
+# print hash map object
+#
+# parameters: hash map
+#
+# return:
+#
+# ------------------------------------------------------------------------
+sub printMap
+{
+    my $j1 = 0;
+    my %obj = @_;
+    my $str = "";
+
+    for(%obj){
+        if(!($j1 % 2)){
+            $str = $_;
+        }
+        else{
+            $log->log(level=>'debug', message=>"'$str' -- '$obj{$str}'\n");
+        }
+        $j1++;
+    }
+}
+
+# ------------------------------------------------------------------------
+# skipping database odject
+#
+# parameters: file handle,
+#
+# return: number of skipped lines, -1 if error
+#
+# ------------------------------------------------------------------------
+sub skipDataBaseObject
+{
+    # skip lines untill enpty one
+    #
+    my $num = 0;
+    my $fd = $_[0];
+    my $line;
+
+    return -1 if(!defined($fd));
+
+    while($line = readline($fd))
+    {
+        $num++;
+        return $num if($line =~ m/^[[:space:]]*$/);
+    }
+
+    return $num;
+}
+
+# ------------------------------------------------------------------------
+# remove leading and trailing spaces (and trailing comment)
+#
+# parameters: string
+#
+# return: string
+# ------------------------------------------------------------------------
+sub trim_string
+{
+    my $str = $_[0];
+
+    return "" if(!defined($str));
+
+    $str =~ s/^[[:space:]]+//;
+#    $str =~ s/#+.*$//;
+    $str =~ s/[[:space:]]+$//;
+    return $str;
+}
+
+# ------------------------------------------------------------------------
+# make a netHandle field
+#
+# parameters: normalized netRange string
+#
+# returns: netHandle string
+# ------------------------------------------------------------------------
+sub makeNetHandle_1
+{
+    my $str = $_[0];
+    my ($ip1, $ip2) = $str =~ m/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+    my $nethandle;
+
+    if(defined($ip1) && defined($ip2)){
+        $nethandle = sprintf("%08X-%08X", ipv4_quaddot_to_decimal($ip1), ipv4_quaddot_to_decimal($ip2));
+    }
+
+    return $nethandle;
+}
+
+sub makeNetHandle
+{
+    my $str = $_[0];
+    my ($ip1, $ip2) = $str =~ m/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+-\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+    my $nethandle;
+	
+	# have to use the whole string because they don't have a user-defined nethandle.
+	
+	my ($net, $cidr);
+		
+	if(defined($ip1) and defined($ip2)) {
+		($net,$cidr) = ipv4_parse($ip1, ipv4_netrange2cidr($ip1, $ip2));
+	}
+	
+    if(defined($ip1)){
+        $ip1 =~ s/\./-/g;
+        $nethandle = "NET-" . $ip1 . '-S' . $cidr;
+    }
+    return $nethandle;
+}
+
+# ------------------------------------------------------------------------
+# make a network range from net/cidr string
+#
+# parameters: net/string
+#
+# return: netrange in form: ip1 - ip2
+# ------------------------------------------------------------------------
+sub makeNetRangeFromNetwork
+{
+    my @vals = $_[0] =~ m/^(\d{1,3}(\.\d{1,3}){1,3})\/(\d{1,2})$/;
+    my $netrange;
+
+    if(@vals){
+        my $j1;
+        my ($net, $cidr) = ($vals[0], $vals[@vals-1]);
+        my @octs = split(/\./, $net);
+        my $mask = (1 << (32 - $cidr)) - 1;
+        my $ip1;
+        my $ip2;
+
+        for($j1 = 0; $j1 < 4; $j1++){
+            $octs[$j1] = 0 if(!defined($octs[$j1]));
+        }
+        $ip1 = ((((($octs[0] << 8) + $octs[1]) << 8) + $octs[2]) << 8) + $octs[3];
+        $ip2 = $ip1 | $mask;
+
+        if($ip1 - ($ip2 & (~$mask))){
+            $log->log(level=>'warn', message=>'wrong net/netmask pair: net $net, mask $cidr\n');
+            return $netrange;
+        }
+
+        $netrange = join('.', @octs);
+        for($j1 = 3; $j1 >= 0; $j1--){
+            $octs[$j1] = $ip2 % 256;
+            $ip2 >>= 8;
+        }
+        $netrange = join(' - ', $netrange, join('.', @octs));
+    }
+    return $netrange;
+}
+
+# ------------------------------------------------------------------------
+# parsing RPSL object into hash array
+#
+# parameters: file descriptor, first attribute and its value
+#
+# return: number of parsed lines if no error, -(number of parsed lines) if error occured and hash array
+# ------------------------------------------------------------------------
+sub parseRPSLObject
+{
+    my $numlines = 0;
+    my ($fd, $attr, $value) = @_;
+    my $line;
+    my %obj = ();
+
+    return ($numlines, %obj) if(!(defined($fd) && defined($attr) && defined($value)));
+
+    $attr = lc($attr);
+    $obj{$attr} = trim_string($value);
+
+    while(($line = readline($fd)) && !($line =~ m/^[[:space:]]*$/)){
+        $numlines++;
+        if(($value) = $line =~ m/^[+\t ](.*)$/){
+            # this line continues the previous one
+            $obj{$attr} = join("\n", $obj{$attr}, trim_string($value));
+        }
+        elsif($line =~ m/^#.*/){
+            # comment, skip
+            next;
+        }
+        elsif(($attr, $value) = $line =~ m/^([^:]+):(.*)$/){
+            # attribute: value pair
+            $attr = lc($attr);
+            $value = trim_string($value);
+            if(defined($obj{$attr})){
+                if($value ne $obj{$attr}){
+                    $obj{$attr} = join("\n", $obj{$attr}, $value);
+                }
+            }
+            else{
+                $obj{$attr} = $value;
+            }
+        }
+        else{
+            # what is this? not an attribute:value pair. error
+            return (-$numlines, %obj);
+        }
+    }
+    $numlines++;
+
+    return ($numlines, %obj);
+}
+
+# ------------------------------------------------------------------------
+# replace some non ASCII chars
+#
+# parameters: input string
+#
+# returns: output string
+# ------------------------------------------------------------------------
+sub replaceNonASCII
+{
+    my $str = $_[0];
+
+    $str=~ s/ö/oe/g;
+    $str=~ s/ä/ae/g;
+    $str=~ s/ü/ue/g;
+    $str=~ s/é/e/g;
+    $str=~ s/Å/A/g;
+    $str=~ s/à/a/g;
+    $str=~ s/å/a/g;
+    $str=~ s/ß/ss/g;
+    $str=~ s/Ä/Ae/g;
+    $str=~ s/Ö/Oe/g;
+    $str=~ s/Ü/Ue/g;
+    $str=~ s/ø/o/g;
+    $str=~ s/Á/A/g;
+    $str=~ s/á/a/g;
+    $str=~ s/Í/I/g;
+    $str=~ s/[^[:print:]]+//g;
+
+    return $str;
+}
+
+# ------------------------------------------------------------------------
+# remove comments, double spaces and new line characters
+#
+# parameters: multiline value with comments
+#
+# return: one line value without comments
+# ------------------------------------------------------------------------
+sub normalizeValue
+{
+    my @vals = split("\n", $_[0]);
+    my $str = "";
+
+    for(@vals){
+        $str = join(" ", $str, $_);
+        $str =~ s/#+.*$//;
+        $str =~ s/[[:space:]]+$//;
+    }
+    $str =~ s/^[[:space:]]+//;
+    $str =~ s/[[:space:]]{2,}/ /g;
+
+    $str = replaceNonASCII($str);
+
+    return $str;
+}
+
+# ------------------------------------------------------------------------
+# return "normalized" date string
+#
+# parameterS: date string
+#
+# return: date string
+# ------------------------------------------------------------------------
+sub normalizeDateString
+{
+    my $j1;
+    my $str = $_[0];
+    my ($year, $month, $day) = split('-', $str);
+    my @days_in_month = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31);
+
+    return "0001-01-01" if(!(defined($year) && defined($month) && defined($day)));
+
+    $days_in_month[1] = 29 if(((0 == $year%4) && (0 != $year%100)) || (0 == $year%400));
+
+    $month--;
+
+    return $str if((0 <= $month) && ($month < 12) && (0 <= $day) && ($day <= $days_in_month[$month]));
+
+    while(0 > $month){
+        $year--;
+        $month += 12;
+    }
+
+    while($month > 12){
+        $year++;
+        $month -= 12;
+    }
+
+    $days_in_month[1] = 29 if(((0 == $year%4) && (0 != $year%100)) || (0 == $year%400));
+
+    while($day <= 0){
+        $month--;
+        if(0 > $month){
+            $year--;
+            $month = 11;
+            $days_in_month[1] = (((0 == $year%4) && (0 != $year%100)) || (0 == $year%400)) ? 29 : 28;
+        }
+        $day += $days_in_month[$month];
+    }
+
+    while($day > $days_in_month[$month]){
+        $day -= $days_in_month[$month];
+        $month++;
+        if(12 <= $month){
+            $month -= 12;
+            $year++;
+            $days_in_month[1] = (((0 == $year%4) && (0 != $year%100)) || (0 == $year%400)) ? 29 : 28;
+        }
+    }
+    $month++;
+
+    $str = sprintf("%04d-%02d-%02d", $year, $month, $day);
+
+    return $str;
+}
+
+# ------------------------------------------------------------------------
+# return Date string from Changed attribute
+#
+# parameter: attribute
+#
+# return: array of date string
+# ------------------------------------------------------------------------
+sub getDatesFromChangedAttr
+{
+    my $mindate = $_[1];
+    my $maxdate = $_[2];
+    my $datestr = "";
+    my $attr = $_[0];
+
+    if(defined($mindate)){
+        ($mindate) = ($mindate =~ m/(\d{4}-\d{2}-\d{2})/);
+    }
+    if(defined($maxdate)){
+        ($maxdate) = ($maxdate =~ m/(\d{4}-\d{2}-\d{2})/);
+    }
+    if(defined($attr)){
+        my @attrs = split("\n", $attr);
+
+        for(@attrs){
+            if(0 == int($_)){
+                $datestr = "2000-01-01";
+            }
+            elsif(($datestr) = ($_ =~ m/^.+\s+(\d+)$/)){
+                if('0' eq substr($datestr, 0, 1)){
+                    $datestr = "20" . $datestr;
+                }
+                elsif('9' eq substr($datestr, 0, 1)){
+                    $datestr = "19" . $datestr;
+                }
+                $datestr = substr($datestr, 0, 4) . "-" . substr($datestr, 4, 2) . "-" . substr($datestr, 6, 2);
+                $mindate = $datestr if((!defined($mindate)) || ($mindate gt $datestr));
+                $maxdate = $datestr if((!defined($maxdate)) || ($maxdate lt $datestr));
+            }
+        }
+    }
+    $mindate = "0001-01-01" if(!(defined($mindate) && ($mindate =~ m/\d{4}(-\d{2}){2}/)));
+    $maxdate = "9999-12-31" if(!(defined($maxdate) && ($maxdate =~ m/\d{4}(-\d{2}){2}/)));
+
+    $mindate = normalizeDateString($mindate);
+    $maxdate = normalizeDateString($maxdate);
+
+    return ($mindate, $maxdate);
+}
+
+# ------------------------------------------------------------------------
+# check and create the organisation in organization table by org_id
+#
+# parameters: org_id to check, orgName, city, country, source, cacheDate
+#
+# returns:
+# ------------------------------------------------------------------------
+sub checkOrganisationByOrgId
+{
+    my $id;
+    my $found;
+    my ($org_id, $orgname, $city, $country, $source, $cacheDate) = @_;
+    my $date_str;
+    my @date_arr;
+
+    return -1 if(!defined($org_id));
+
+    $cacheDate = time() if(!defined($cacheDate));
+
+    @date_arr = localtime($cacheDate);
+    $date_str = ($date_arr[5] + 1900) . "-" . ($date_arr[4] + 1) . "-" . ($date_arr[3] + 1);
+
+    $source = 0 if(!defined($source));
+
+    $select_from_org_by_orgid_sth->execute($org_id) or die "Could not select from database: $DBI::errstr";
+    $found = 1 if($id = $select_from_org_by_orgid_sth->fetchrow_array());
+    $select_from_org_by_orgid_sth->finish();
+    return if(defined($found));
+
+    $insert_into_org_sth->execute($org_id, $orgname, 1, "", "", "", "", "", "", $city, "", $country, "", $date_str,
+                                  "", $date_str, "", "", "", "", "", $source, $cacheDate, $cacheDate)
+                                  or die "Could not insert into database: $DBI::errstr";
+    $insert_into_org_sth->finish();
+}
+
+# ------------------------------------------------------------------------
+# parsing organisation object
+#
+# parameters: file descriptor, the organisation (value from 'organisation:value' pair), date
+#
+# returns: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parseOrganisationObject
+{
+    my $j1;
+    my $id = 0;
+    my $found = 0;
+    my ($fd, $value, $cacheDate) = @_;
+    my ($numlines, %obj) = parseRPSLObject($fd, 'organisation', $value);
+
+    $cacheDate = time() if(!defined($cacheDate));
+
+    if(0 < $numlines){
+        my $canAllocate = 0;
+        my $city = "";
+        my $state = "";
+        my $postalCode = "";
+        my $referralServer = "";
+        my $nocHandle = "";
+        my ($orgId, $orgName, $country, $comment, $adminHandle, $abuseHandle, $techHandle, $source) =
+           ($obj{'organisation'}, $obj{'org-name'}, $obj{'country'}, $obj{'descr'}, $obj{'admin-c'}, $obj{'abuse-c'},
+            $obj{'tech-c'}, $obj{'source'});
+        my @addrs = split("\n", $obj{'address'});
+        my ($regDate, $updDate) = getDatesFromChangedAttr($obj{'changed'}, $obj{'created'}, $obj{'last-modified'});
+
+        #printMap(%obj);
+
+        return -$numlines if(!(defined($orgId) && defined($orgName) && defined(@addrs)));
+
+        $country = "" if(!defined($country));
+        $country = substr(normalizeValue($country), 0, $fields_length{'organization.country'});
+        $comment = "" if(!defined($comment));
+        $comment = substr(normalizeValue($comment), 0, $fields_length{'organization.comment'});
+        $adminHandle = "" if(!defined($adminHandle));
+        $adminHandle = substr(normalizeValue($adminHandle), 0, $fields_length{'organization.adminHandle'});
+        $abuseHandle = "" if(!defined($abuseHandle));
+        $abuseHandle = substr(normalizeValue($abuseHandle), 0, $fields_length{'organization.abuseHandle'});
+        $techHandle = "" if(!defined($techHandle));
+        $techHandle = substr(normalizeValue($techHandle), 0, $fields_length{'organization.techHandle'});
+        $source = 0 if(!defined($source));
+
+        $source = $sources{lc($source)};
+        $source = 0 if(!defined($source));
+
+        for($j1 = 0; $j1 < 6; $j1++){
+            $addrs[$j1] = "" if(!defined($addrs[$j1]));
+            $addrs[$j1] = substr($addrs[$j1], 0, $fields_length{'organization.addrs'});
+        }
+		
+		# truncate org-id
+		$orgId = substr(trim_string($orgId), 0, $fields_length{'organization.orgId'});
+
+        $select_from_org_by_orgid_sth->execute($orgId) or die "Could not select from database: $DBI::errstr";
+        $found = 1 if($id = $select_from_org_by_orgid_sth->fetchrow_array());
+        $select_from_org_by_orgid_sth->finish();
+
+        $log->log(level=>'debug', message=>"Organisation object: orgId -> $orgId, orgname -> $orgName, country -> $country, " .
+                                           "regDate -> $regDate, updDate -> $updDate, comment -> $comment, " .
+                                           "adminHandle -> $adminHandle, abuseHandle -> $abuseHandle, " .
+                                           "techHandle -> $techHandle, source -> $source; found -> $found, id -> $id \n\n");
+
+$orgName = substr($orgName, 0, $fields_length{'organization.orgName'});
+        if(1 == $found){
+            $update_org_sth->execute($orgId, $orgName, $canAllocate, $addrs[0], $addrs[1], $addrs[2], $addrs[3],
+                                     $addrs[4], $addrs[5], $city, $state, $country, $postalCode, $regDate, $comment,
+                                     $updDate, $referralServer, $adminHandle, $nocHandle, $abuseHandle, $techHandle,
+                                     $source, $cacheDate, $id) or die "Could not update record: $DBI::errstr";
+            $update_org_sth->finish();
+        }
+        else{
+            $insert_into_org_sth->execute($orgId, $orgName, $canAllocate, $addrs[0], $addrs[1], $addrs[2], $addrs[3],
+                                          $addrs[4], $addrs[5], $city, $state, $country, $postalCode, $regDate, $comment,
+                                          $updDate, $referralServer, $adminHandle, $nocHandle, $abuseHandle, $techHandle,
+                                          $source, $cacheDate, $cacheDate) or die "Could not update record: $DBI::errstr";
+            $insert_into_org_sth->finish();
+        }
+    }
+
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing aut-num object in RPSL database lacnic.db
+#
+# parameters: date, numberofline, %obj
+#
+# returns: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parseAutNumObjectLacnic
+{
+    my $cacheDate = shift;
+    my $numlines = shift;
+    my %obj = @_;
+
+    #printMap(%obj);
+
+    my $comment = "";
+    my ($asHandle, $asName, $techHandle, $source, $orgId, $orgname, $regDate, $updDate, $country, $city) =
+        ($obj{'aut-num'}, $obj{'as-name'}, $obj{'tech-c'}, $obj{'source'}, $obj{'owner-c'}, $obj{'owner'},
+         $obj{'created'}, $obj{'changed'}, $obj{'country'}, $obj{'city'});
+    my $asn;
+    my $found = 0;
+    my $org_id_1;
+    my $id;
+
+    $asHandle = substr(normalizeValue($asHandle), 0, $fields_length{'asn.asHandle'});
+    ($asn) = $asHandle =~ m/\D*(\d+)\D*/;
+
+    return -$numlines if(!(defined($asHandle) && defined($asn)));
+
+
+    $asName = substr(normalizeValue($asName), 0, $fields_length{'asn.asName'});
+    $asName = "" if(!defined($asName));
+    $techHandle = substr(normalizeValue($techHandle), 0, $fields_length{'asn.techHandle'});
+    $techHandle = "" if(!defined($techHandle));
+    $source = $sources{lc(normalizeValue($source))};
+    $source = 0 if(!defined($source));
+    $country = substr(normalizeValue($country), 0, $fields_length{'organization.country'});
+    $country = "" if(!defined($country));
+    $city = substr(normalizeValue($city), 0, $fields_length{'organization.city'});
+    $city = "" if(!defined($city));
+
+	my $as_orgName = $orgname;
+	my $as_orgName = replaceNonASCII($as_orgName);
+	$as_orgName = substr(trim_string($as_orgName), 0, $fields_length{'asn.as_orgname'});
+	
+    $select_from_asn_by_asn_1_sth->execute($asn) or die "Can't select record: $DBI::errstr";
+    $found = 1 if(($id, $org_id_1) = $select_from_asn_by_asn_1_sth->fetchrow_array());
+    $select_from_asn_by_asn_1_sth->finish();
+
+
+    $log->log(level=>'debug', message=>"Aut-num object: asHandle -> $asHandle, orgId -> $orgId, asName -> $asName, as-orgName -> $as_orgName, ".
+                                        "comment -> $comment, techHandle -> $techHandle, regDate -> $regDate, " .
+                                        "updDate -> $updDate, asn -> $asn; found -> $found, id -> $id, org_id: $org_id_1\n\n");
+    if(1 == $found){
+        $orgId = $org_id_1 if(defined($org_id_1));
+        $update_asn_rpsl_sth->execute($asHandle, $orgId, $as_orgName, $asn, $asName, $regDate, $comment, $updDate, "", $techHandle,
+                                    $source, $cacheDate, "", $id) or die "Could not update record: $DBI::errstr";
+        $update_asn_rpsl_sth->finish();
+    }
+    else{
+        checkOrganisationByOrgId($orgId, $orgname, $city, $country, $source, $cacheDate);
+        $insert_into_asn_rpsl_sth->execute($asHandle, $orgId, $as_orgName, $asn, $asName, $regDate, $comment, $updDate, "", $techHandle,
+                                        $source, $cacheDate, $cacheDate, "") or die "Could not insert record: $DBI::errstr";
+        $insert_into_asn_rpsl_sth->finish();
+    }
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing aut-num object in RPSL database
+#
+# parameters: file descriptor, the autonomous system number (value from aut-num:value' pair), date
+#
+# returns: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parseAutNumObject
+{
+    my $id = 0;
+    my $found = 0;
+    my ($fd, $value, $cacheDate) = @_;
+    my ($numlines, %obj) = parseRPSLObject($fd, 'aut-num', $value);
+
+    $cacheDate = time() if(!defined($cacheDate));
+    if(defined($obj{'owner'}) && ("lacnic" eq lc($obj{'source'}))) {
+        return parseAutNumObjectLacnic($cacheDate, $numlines, %obj);
+    }
+
+    if(0 < $numlines){
+        my $org_attr_exists = 0;
+        my $org_id_1;
+        my $orgName;
+		my $as_orgName;
+        my @descr = split('\n', $obj{'descr'});
+        my ($asHandle, $asName, $comment, $adminHandle, $techHandle, $source, $orgId, $mailbox) =
+		($obj{'aut-num'}, $obj{'as-name'}, $obj{'remarks'}, $obj{'admin-c'}, $obj{'tech-c'}, $obj{'source'}, $obj{'org'}, $obj{'notify'});
+        my ($regDate, $updDate) = getDatesFromChangedAttr($obj{'changed'}, $obj{'created'}, $obj{'last-modified'});
+        my ($asn) = lc($asHandle) =~ m/^as(\d+)\s*#*.*$/;
+
+        #printMap(%obj);
+        ($asn) = lc($asHandle) =~ m/^(\d+)\s*#*.*$/ if(!defined($asn));
+
+        $source = 0 if(!defined($source));
+
+        #return -$numlines if(!(defined($asHandle) && defined($asName) && defined($techHandle) && defined($asn)));
+        #
+        # in lacnic.db there are no as-name and tech-c attributes. so...
+        #
+        return -$numlines if(!(defined($asHandle) && defined($asn)));
+        
+        $orgName = $descr[0];
+        $orgName = $descr[1] if($orgName =~ m/^\~\{.*\~\}(\(\~\{.*\~\}\))*$/);
+        $orgName = $descr[1] if(("" eq $orgName) && defined($descr[1]));
+        $orgName = replaceNonASCII($orgName);
+        $orgName = substr(trim_string($orgName), 0, $fields_length{'organization.orgName'});
+
+        $as_orgName = '';
+
+        # If the description looks like an address or other, prepend the as-name if it exists
+        if(length($asName) > 3 && $asName !~ /^unspecified|autonomous/i) 
+        {
+            if($descr[0] !~ /\d\d|---|pool/i && length($descr[0]) > 4) 
+            {
+                $as_orgName = $descr[0];
+            }
+            elsif($descr[1] !~ /\d\d|---|pool/i && length($descr[1]) > 4) 
+            {
+                $as_orgName = $descr[1];
+            }
+            elsif(length($descr[0]) > 4)
+            {
+                $as_orgName = $asName . ' ' . $descr[0]; 
+            }
+            elsif(length($descr[1]) > 4)
+            {
+                $as_orgName = $asName . ' ' . $descr[1];
+            }
+            else {  $as_orgName = $asName; }
+        }
+
+        # Uncomment the following line to always prepend the as-org-name with as-name if it exists
+        #$as_orgName = $asName;
+        $asName = $orgName if ("UNSPECIFIED" eq $asName);
+        $as_orgName = $orgName if ("UNSPECIFIED" eq $as_orgName);
+        $as_orgName = $asName if("" eq $as_orgName);
+        $as_orgName = replaceNonASCII($as_orgName);
+        $as_orgName = substr(trim_string($as_orgName), 0, $fields_length{'asn.as_orgname'});
+
+        if(defined($orgId)){
+            $org_attr_exists = 1;
+        }
+        else{
+            $orgId = $orgName;
+        }
+        $orgId = substr(trim_string($orgId), 0, $fields_length{'asn.orgId'});
+        $orgId = replaceNonASCII($orgId);
+
+        $comment = "" if(!defined($comment));
+        $asName = substr($asName, 0, $fields_length{'asn.asName'});
+        $comment = substr(normalizeValue($comment), 0, $fields_length{'asn.comment'});
+        $adminHandle = substr(normalizeValue($adminHandle), 0, $fields_length{'asn.adminHandle'});
+        $techHandle = substr(normalizeValue($techHandle), 0, $fields_length{'asn.techHandle'});
+
+        $mailbox = "" if(!defined($mailbox));
+        ($mailbox) = $mailbox =~ m/^\s*([^\s]+)/;
+        $mailbox = substr($mailbox, 0, $fields_length{'asn.mailbox'});
+
+        $source = $sources{lc($source)};
+        $source = 0 if(!defined($source));
+
+        $select_from_asn_by_asn_1_sth->execute($asn) or die "Can't select record: $DBI::errstr";
+        $found = 1 if(($id, $org_id_1) = $select_from_asn_by_asn_1_sth->fetchrow_array());
+        $select_from_asn_by_asn_1_sth->finish();
+
+        $log->log(level=>'debug', message=>"Aut-num object: asHandle -> $asHandle, orgId -> $orgId, asName -> $asName, " .
+                                           "comment -> $comment, adminHandle -> $adminHandle, techHandle -> $techHandle, regDate -> $regDate, " .
+                                           "updDate -> $updDate, asn -> $asn; found -> $found, id -> $id, org_id -> $org_id_1, " .
+                                           "as_orgName -> $as_orgName, mailbox -> $mailbox\n\n");
+        if(1 == $found){
+            $orgId = $org_id_1 if(defined($org_id_1) && (0 == $org_attr_exists));
+            $update_asn_rpsl_sth->execute($asHandle, $orgId, $as_orgName, $asn, $asName, $regDate, $comment, $updDate, $adminHandle, $techHandle,
+                                     $source, $cacheDate, $mailbox, $id) or die "Could not update record: $DBI::errstr";
+            $update_asn_rpsl_sth->finish();
+        }
+        else{
+            checkOrganisationByOrgId($orgId, $orgName, "", "", $source, $cacheDate);
+            $insert_into_asn_rpsl_sth->execute($asHandle, $orgId, $as_orgName, $asn, $asName, $regDate, $comment, $updDate, $adminHandle, $techHandle,
+                                          $source, $cacheDate, $cacheDate, $mailbox) or die "Could not insert record: $DBI::errstr";
+            $insert_into_asn_rpsl_sth->finish();
+        }
+    }
+
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing person object in RPSL database
+#
+# parameters: file descriptor, person full name (value from 'person:value' pair), date
+#
+# return: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parsePersonObject
+{
+    my $j1;
+    my $id = 0;
+    my $found = 0;
+    my ($fd, $value, $cacheDate) = @_;
+    my ($numlines, %obj) = parseRPSLObject($fd, 'person', $value);
+
+    $cacheDate = time() if(!defined($cacheDate));
+
+    if(0 < $numlines){
+        my @addrs = split("\n", $obj{'address'});
+        my ($person, $pocHandle, $country,
+            $comment, $officePhone, $mailbox, $source) =
+           ($obj{'person'}, $obj{'nic-hdl'}, $obj{'country'},
+            $obj{'remark'}, $obj{'phone'}, $obj{'e-mail'}, $obj{'source'});
+        my ($firstName, $middleName, $lastName);
+        my ($regDate, $updDate) = getDatesFromChangedAttr($obj{'changed'}, $obj{'created'}, $obj{'last-modified'});
+
+        #printMap(%obj);
+
+        $source = 0 if(!defined($source));
+        return -$numlines if(!(defined($person) && defined(@addrs) && defined($officePhone) &&
+                               defined($mailbox) && defined($pocHandle) && defined($source)));
+
+        for($j1 = 0; $j1 < 6; $j1++){
+            $addrs[$j1] = "" if(!defined($addrs[$j1]));
+            $addrs[$j1] = substr(normalizeValue($addrs[$j1]), 0, $fields_length{'poc.addrs'});
+        }
+
+        $pocHandle = substr(normalizeValue($pocHandle), 0, $fields_length{'poc.pocHandle'});
+        $comment = substr(normalizeValue($comment), 0, $fields_length{'poc.comment'});
+        $officePhone = substr(normalizeValue($officePhone), 0, $fields_length{'poc.officePhone'});
+        $mailbox = substr(normalizeValue($mailbox), 0, $fields_length{'poc.mailbox'});
+
+        $source = $sources{lc($source)};
+        $source = 0 if(!defined($source));
+
+        ($firstName, $middleName, $lastName) = $person =~ m/^([^\s]+)(.*)\s([^\s]+)$/;
+        $country = "" if(!defined($country));
+        $country = substr(normalizeValue($country), 0, $fields_length{'poc.country'});
+        $firstName = "" if(!defined($firstName));
+        $middleName = "" if(!defined($middleName));
+        $lastName = "" if(!defined($lastName));
+        $firstName = substr($firstName, 0, $fields_length{'poc.firstName'});
+        $middleName = substr($middleName, 0, $fields_length{'poc.middleName'});
+        $lastName = substr($lastName, 0, $fields_length{'poc.lastName'});
+
+        $select_from_poc_by_pochandle_sth->execute($pocHandle) or die "Can't select record: $DBI::errstr";
+        $found = 1 if($id = $select_from_poc_by_pochandle_sth->fetchrow_array());
+        $select_from_poc_by_pochandle_sth->finish();
+
+        $log->log(level=>'debug', message=>"Person object: person -> $person, pocHandle -> $pocHandle, country -> $country, " .
+                                            "officePhone -> $officePhone, mailbox -> $mailbox, source -> $source, " .
+                                            "regDate -> $regDate, updDate -> $updDate, firstName -> $firstName, " .
+                                            "middleName -> $middleName, lastName -> $lastName; " .
+                                            "found -> $found, id -> $id \n\n");
+        if(1 == $found){
+            $update_poc_sth->execute($pocHandle, 0, $firstName, $lastName, $middleName, "", $addrs[0], $addrs[1],
+                                     $addrs[2], $addrs[3], $addrs[4], $addrs[5], "", "", $country, "", $regDate,
+                                     $comment, $updDate, $officePhone, $mailbox, $source, $cacheDate, $id)
+                                     or die "Can't update record: $DBI::errstr";
+            $update_poc_sth->finish();
+        }
+        else{
+            $insert_into_poc_sth->execute($pocHandle, 0, $firstName, $lastName, $middleName, "", $addrs[0], $addrs[1],
+                                          $addrs[2], $addrs[3], $addrs[4], $addrs[5], "", "", $country, "", $regDate,
+                                          $comment, $updDate, $officePhone, $mailbox, $source, $cacheDate, $cacheDate)
+                                          or die "Can't insert record: $DBI::errstr";
+            $insert_into_poc_sth->finish();
+        }
+    }
+
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing role object in RPSL database
+#
+# parameters: file descriptor, role name (value from 'role:value' pair), date
+#
+# return: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parseRoleObject
+{
+    my $j1;
+    my $id = 0;
+    my $found = 0;
+    my ($fd, $value, $cacheDate) = @_;
+    my ($numlines, %obj) = parseRPSLObject($fd, 'role', $value);
+
+    $cacheDate = time() if(!defined($cacheDate));
+
+    if(0 < $numlines){
+        my @addrs = split("\n", $obj{'address'});
+        my ($role, $pocHandle, $country,
+		$comment, $officePhone, $mailbox, $source) =
+		($obj{'role'}, $obj{'nic-hdl'}, $obj{'country'},
+		$obj{'remark'}, $obj{'phone'}, $obj{'e-mail'}, $obj{'source'});
+        my ($regDate, $updDate) = getDatesFromChangedAttr($obj{'changed'}, $obj{'created'}, $obj{'last-modified'});
+
+        #printMap(%obj);
+
+        $source = 0 if(!defined($source));
+        $mailbox = $obj{'notify'} if (!defined($mailbox) || "unread@" eq substr($mailbox, 0, 7));
+        $mailbox = $obj{'abuse-mailbox'} if (!defined($mailbox) || "unread@" eq substr($mailbox, 0, 7));
+        return -$numlines if(!(defined($role) && defined(@addrs) &&
+			defined($mailbox) && defined($pocHandle) && defined($source)));
+        ($mailbox) = $mailbox =~ m/^\s*([^\s]+)/;
+        for($j1 = 0; $j1 < 6; $j1++){
+            $addrs[$j1] = "" if(!defined($addrs[$j1]));
+            $addrs[$j1] = substr(normalizeValue($addrs[$j1]), 0, $fields_length{'poc.addrs'});
+        }
+
+        $pocHandle = substr(normalizeValue($pocHandle), 0, $fields_length{'poc.pocHandle'});
+        $comment = substr(normalizeValue($comment), 0, $fields_length{'poc.comment'});
+        $officePhone = "" if(!defined($officePhone));
+        $officePhone = substr(normalizeValue($officePhone), 0, $fields_length{'poc.officePhone'});
+        $mailbox = substr(normalizeValue($mailbox), 0, $fields_length{'poc.mailbox'});
+
+        $source = $sources{lc($source)};
+        $source = 0 if(!defined($source));
+
+        $country = "" if(!defined($country));
+        $country = substr(normalizeValue($country), 0, $fields_length{'poc.country'});
+        $role = substr($role, 0, $fields_length{'poc.roleName'});
+
+        $select_from_poc_by_pochandle_sth->execute($pocHandle) or die "Can't select record: $DBI::errstr";
+        $found = 1 if($id = $select_from_poc_by_pochandle_sth->fetchrow_array());
+        $select_from_poc_by_pochandle_sth->finish();
+
+        $log->log(level=>'debug', message=>"Role object: role -> $role, pocHandle -> $pocHandle, country -> $country, " .
+		"officePhone -> $officePhone, mailbox -> $mailbox, source -> $source, " .
+		"regDate -> $regDate, updDate -> $updDate, " .
+		"found -> $found, id -> $id \n\n");
+        if(1 == $found){
+            $update_poc_sth->execute($pocHandle, 1, "", "", "", $role, $addrs[0], $addrs[1],
+			$addrs[2], $addrs[3], $addrs[4], $addrs[5], "", "", $country, "", $regDate,
+			$comment, $updDate, $officePhone, $mailbox, $source, $cacheDate, $id)
+			or die "Can't update record: $DBI::errstr";
+            $update_poc_sth->finish();
+        }
+        else{
+            $insert_into_poc_sth->execute($pocHandle, 1, "", "", "", $role, $addrs[0], $addrs[1],
+			$addrs[2], $addrs[3], $addrs[4], $addrs[5], "", "", $country, "", $regDate,
+			$comment, $updDate, $officePhone, $mailbox, $source, $cacheDate, $cacheDate)
+			or die "Can't insert record: $DBI::errstr";
+            $insert_into_poc_sth->finish();
+        }
+    }
+
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing inetnum object in lacnic.db
+#
+# parameters: date, numberofline, %obj
+#
+# return: number of parsed lines if no error, -(number of parsed lines) if error occured
+# ------------------------------------------------------------------------
+sub parseInetnumObjectLacnic
+{
+    my $cacheDate = shift;
+    my $numlines = shift;
+    my %obj = @_;
+    my $j1;
+    my $id;
+    my $found = 0;
+    my $org_id_1;
+    my $network;
+	my $enetrange;
+    my $netName;
+    my $netType;
+    my $nocHandle = "";
+    my $comment = "";
+
+    printMap(%obj);
+
+    my $netHandle;
+    my @nameservers = split('\n', $obj{'nserver'});
+    my ($netRange, $orgname, $orgId, $techHandle, $city, $country,
+        $parent, $regDate, $updDate, $source, $abuseHandle) =
+       ($obj{'inetnum'}, $obj{'owner'}, $obj{'owner-c'}, $obj{'tech-c'}, $obj{'city'}, $obj{'country'},
+        $obj{'inetnum-up'}, $obj{'created'}, $obj{'changed'}, $obj{'source'}, $obj{'abuse-c'});
+
+    $netRange = substr(normalizeValue($netRange), 0, $fields_length{'netblock.netRange'});
+    if($netRange =~ m/[[:xdigit:]]+(:[[:xdigit:]]*)+\/\d+/){
+        $log->log(level=>'warning', message=>"inetnum object is really inet6num ($netRange), skipped\n");
+        return -$numlines;
+    }
+    $netRange = makeNetRangeFromNetwork($netRange) if($netRange =~ m/\d{1,3}(\.\d{1,3}){1,3}\/\d{1,2}/);
+
+    return -$numlines if(!($netRange =~ m/^\d{1,3}(\.\d{1,3}){3} - \d{1,3}(\.\d{1,3}){3}$/));
+
+
+    $netHandle = makeNetHandle($netRange);
+    $netName = $netHandle;
+
+    return -$numlines if(!defined($netHandle));
+
+    $orgId = $orgname if(!defined($orgId));
+    $orgId = substr(trim_string($orgId), 0, $fields_length{'organization.orgId'});
+    $orgname = substr(trim_string($orgname), 0, $fields_length{'netblock.orgname'});
+    $orgname = "" if(!defined($orgname));
+    $techHandle = substr(normalizeValue($techHandle), 0, $fields_length{'organization.techHandle'});
+    $city = substr(normalizeValue($city), 0, $fields_length{'organization.city'});
+    $city = "" if(!defined($city));
+    $country = substr(normalizeValue($country), 0, $fields_length{'organization.country'});
+    $country = "" if(!defined($country));
+    if(defined($parent)){
+        $parent = normalizeValue($parent);
+        $parent = makeNetRangeFromNetwork($parent);
+        $parent = makeNetHandle($parent);
+    }
+    $parent = "" if(!defined($parent));
+    $abuseHandle = substr(normalizeValue($abuseHandle), 0, $fields_length{'netblock.abuseHandle'});
+    $abuseHandle = "" if(!defined($abuseHandle));
+    $regDate = normalizeValue($regDate);
+    $updDate = normalizeValue($updDate);
+    $source = $sources{lc(normalizeValue($source))};
+    $source = 0 if(!defined($source));
+    ($network) = $netRange =~ m/^(\d+\.\d+\.\d+\.\d+).*$/;
+    ($enetrange) = $netRange =~ m/^\d+\.\d+\.\d+\.\d+\s+-\s+(\d+\.\d+\.\d+\.\d+).*$/;
+
+    for($j1 = 0; $j1 < 4; $j1++){
+        $nameservers[$j1] = "" if(!defined($nameservers[$j1]));
+        $nameservers[$j1] = substr($nameservers[$j1], 0, $fields_length{'netblock.ns'});
+    }
+    $netType = $netTypes{lc($obj{'status'})} if(defined(lc($obj{'status'})));
+    $netType = 0 if(!defined($netType));
+
+    $select_from_netblock_by_nethandle_sth->execute($netHandle) or die "Can't select record: $DBI::errstr";
+    $found = 1 if(($id, $org_id_1) = $select_from_netblock_by_nethandle_sth->fetchrow_array());
+    $select_from_netblock_by_nethandle_sth->finish();
+
+    $log->log(level=>'debug', message=>"netHandle: $netHandle; orgId: $orgId; parent: $parent; netName: $netName;" .
+                                        "netRange: $netRange; network: $network; netType: $netType; regDate: $regDate; ".
+                                        "comment: $comment; updDate: $updDate; " .
+                                        "ns: $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3]; " .
+                                        "nocHandle: $nocHandle; abuseHandle: $abuseHandle; techHandle: $techHandle; " .
+                                        "source: $source; cacheDate: $cacheDate; " .
+                                        "found: $found; orgname: $orgname; id: $id, org_id_1: $org_id_1 \n\n");
+
+    my $tmp_reg;
+    if(($current_registry > 0) && ($current_registry != ($tmp_reg = getRegistry(ipv4_quaddot_to_decimal($network))))){
+            $log->log(level=>'warning', message=>"whois field from IANA IPv4 address space registry does not equal " .
+                                                 "the current one: $current_registry --- $tmp_reg, " .
+                                                 "$netRange --- $network; comment: $comment\n");
+        return $numlines if($SKIP_UNMATCHED); # should we insert this block into database ?
+    }
+
+    if(1 == $found){
+        #$orgId = $org_id_1 if(defined($org_id_1));
+        $update_netblock_rpsl_sth->execute($netHandle, $orgname, $orgId, $parent, $netName, $netRange,
+                                        ipv4_quaddot_to_decimal($network), ipv4_quaddot_to_decimal($enetrange), $netType, $regDate, $comment, $updDate,
+                                        $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3],
+                                        $nocHandle, $abuseHandle, $techHandle, $source, $cacheDate, "", $id)
+                                        or die "Can't update record: $DBI::errstr";
+        $update_netblock_rpsl_sth->finish();
+    }
+    else{
+        checkOrganisationByOrgId($orgId, $orgname, $city, $country, $source, $cacheDate);
+        $insert_into_netblock_rpsl_sth->execute($netHandle, $orgname, $orgId, $parent, $netName, $netRange,
+                                            ipv4_quaddot_to_decimal($network), ipv4_quaddot_to_decimal($enetrange), $netType, $regDate, $comment, $updDate,
+                                            $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3],
+                                            $nocHandle, $abuseHandle, $techHandle, $source, $cacheDate, $cacheDate, "")
+                                            or die "Can't insert record: $DBI::errstr";
+        $insert_into_netblock_rpsl_sth->finish();
+    }
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing inetnum object in RPSL database
+#
+# parameters: file descriptor, address range (value from 'inetnum:value' pair), date
+#
+# return: number of parsed lines if no error, -(number of parsed lines) if error occured
+#
+# ------------------------------------------------------------------------
+# Nethandle as example from ripe.db.inetnum
+# assuming fixed format:
+#inetnum:         ->netRange
+#netname:        -> netHandle
+#descr:          -> first line = orgId
+#country:        -> ignoring cause of GeoIP usage
+#admin-c:        -> abuseHandle
+#tech-c:         -> techHandle
+#rev-srv:        -> nameserver[x]
+#status:         -> parsing
+#remarks:        -> comment
+#changed:        -> parsing for register date and latest update
+#mnt-by:         -> nocHandle
+#source:         -> parsing
+# ------------------------------------------------------------------------
+sub parseInetnumObject
+{
+
+    my $j1;
+    my $fd = $_[0];
+    my $cacheDate = $_[2];
+    my $value = $_[1];
+    my ($numlines, %obj) = parseRPSLObject($fd, 'inetnum', $value);
+
+    $cacheDate = time() if(!defined($cacheDate));
+    if((($value =~ m/\d{1,3}(\.\d{1,3}){1,3}\/\d{1,2}/) || ($value =~ m/[[:xdigit:]]+(:[[:xdigit:]]*)+\/\d+/)) &&
+       defined($obj{'owner'})){ # && ("lacnic" eq lc($obj{'source'}))
+        return parseInetnumObjectLacnic($cacheDate, $numlines, %obj);
+    }
+
+    if($numlines > 0){
+        my $id;
+        my $found = 0;
+        my $org_attr_exists = 0;
+        my $org_id_1;
+        my $parent = "";
+        my $netType = 0;
+        my $network = "";
+		my $enetrange = '';
+        my $source = 0;
+        my @nameservers = split('\n', $obj{'rev-srv'});
+        my $netHandle;
+        my $orgName;
+        my @descr = split('\n', $obj{'descr'});
+        my ($netRange, $netName, $abuseHandle, $techHandle,
+            $comment, $changed, $nocHandle, $source, $orgId, $mailbox) =
+           ($obj{'inetnum'}, $obj{'netname'}, $obj{'admin-c'}, $obj{'tech-c'},
+           $obj{'remarks'}, $obj{'changed'}, $obj{'mnt-by'}, $obj{'source'}, $obj{'org'}, $obj{'notify'});
+        my ($regDate, $updDate) = getDatesFromChangedAttr($changed, $obj{'created'}, $obj{'last-modified'});
+
+        #printMap(%obj);
+
+        return -$numlines if(!(defined($netRange)));
+
+        $netRange = substr(normalizeValue($netRange), 0, $fields_length{'netblock.netRange'});
+
+        $netRange = makeNetRangeFromNetwork($netRange) if($netRange =~ m/\d{1,3}(\.\d{1,3}){1,3}\/\d{1,2}/);
+
+        $netHandle = makeNetHandle($netRange);
+		
+		#print STDOUT "Nethandle: $netHandle for '$netRange'\n";
+
+        return -$numlines if(!defined($netHandle));
+
+        if ("IANA-BLOCK" eq $netName
+        || "Not allocated by APNIC" eq $descr[0]
+        || "This network range is not allocated to APNIC." eq $descr[0]){
+            $log->log(level=>'debug', message=>"Network range $netRange is not allocated to APNIC. Skipped\n");
+            return -$numlines;
+        }
+        if("IPv4 address block not managed by the RIPE NCC" eq $descr[0]){
+        # || "NON-RIPE-NCC-MANAGED-ADDRESS-BLOCK" eq $netName
+            $log->log(level=>'debug', message=>"Network range $netRange is not allocated to RIPE. Skipped\n");
+            return -$numlines;
+        }
+        
+        my $as_orgName = '';
+
+        # If the description looks like an address or other, prepend the as-name if it exists
+        if(length($netName) > 3 && $netName !~ /^unspecified|allocated/i) 
+        {
+            if($descr[0] !~ /\d\d|---|pool/i && length($descr[0]) > 4) 
+            {
+                $orgName = $descr[0];
+            }
+            elsif($descr[1] !~ /\d\d|---|pool/i && length($descr[1]) > 4) 
+            {
+                $orgName = $descr[1];
+            }
+            elsif(length($descr[0]) > 4)
+            {
+                $orgName = $netName . ' ' . $descr[0]; 
+            }
+            elsif(length($descr[1]) > 4)
+            {
+                $orgName = $netName . ' ' . $descr[1];
+            }
+            else {  $orgName = $netName; }
+        }
+
+        # Uncomment the following line to always prepend the orgname with net-name if it exists
+        #$orgName = $netName;
+
+        $orgName = $netName if("" eq $orgName || $orgName =~ /^imported inetnum object for/i);
+        $orgName = replaceNonASCII($orgName);
+        $orgName = substr(trim_string($orgName), 0, $fields_length{'netblock.orgname'});
+
+        if(defined($orgId)){
+            $org_attr_exists = 1;
+        }
+        else{
+            $orgId = $orgName;
+        }
+        $orgId = substr(replaceNonASCII(trim_string($orgId)), 0, $fields_length{'netblock.orgId'});
+
+        #$netHandle = substr(normalizeValue($netHandle), 0, $fields_length{'netblock.netHandle'});
+        $netName = substr(normalizeValue($netName), 0, $fields_length{'netblock.netName'});
+        $abuseHandle = substr(normalizeValue($abuseHandle), 0, $fields_length{'netblock.abuseHandle'});
+        $techHandle = substr(normalizeValue($techHandle), 0, $fields_length{'netblock.techHandle'});
+        $comment = substr(normalizeValue($comment), 0, $fields_length{'netblock.comment'});
+        $nocHandle = substr(normalizeValue($nocHandle), 0, $fields_length{'netblock.nocHandle'});
+
+        $source = $sources{lc($source)};
+        $source = 0 if(!defined($source));
+
+        if(defined($obj{'parent'})){
+            $parent = (split("\n", $obj{'parent'}))[-1];
+        }
+        $netType = $netTypes{lc($obj{'status'})} if(defined(lc($obj{'status'})));
+        $netType = 0 if(!defined($netType));
+        $source = 0 if(!defined($source));
+        ($network) = $netRange =~ m/^(\d+\.\d+\.\d+\.\d+).*$/;
+        if($network eq "0.0.0.0"){
+            return -$numlines;
+        }
+        ($enetrange) = $netRange =~ m/^\d+\.\d+\.\d+\.\d+\s+-\s+(\d+\.\d+\.\d+\.\d+).*$/;
+
+        for($j1 = 0; $j1 < 4; $j1++){
+            $nameservers[$j1] = "" if(!defined($nameservers[$j1]));
+            $nameservers[$j1] = substr($nameservers[$j1], 0, $fields_length{'netblock.ns'});
+        }
+        $mailbox = "" if(!defined($mailbox));
+        ($mailbox) = $mailbox =~ m/^\s*([^\s]+)/;
+        $mailbox = substr($mailbox, 0, $fields_length{'netblock.mailbox'});
+
+        $select_from_netblock_by_nethandle_sth->execute($netHandle) or die "Can't select record: $DBI::errstr";
+        $found = 1 if(($id, $org_id_1) = $select_from_netblock_by_nethandle_sth->fetchrow_array());
+        $select_from_netblock_by_nethandle_sth->finish();
+
+        $log->log(level=>'debug', message=>"netHandle: $netHandle; orgId: $orgId; parent: $parent; netName: $netName;" .
+                                           "netRange: $netRange; network: $network; netType: $netType; regDate: $regDate; ".
+                                           "comment: $comment; updDate: $updDate; " .
+                                           "ns: $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3]; " .
+                                           "nocHandle: $nocHandle; abuseHandle: $abuseHandle; techHandle: $techHandle; " .
+                                           "source: $source; cacheDate: $cacheDate; " .
+                                           "found: $found, id: $id, org_id_1: $org_id_1 \n\n");
+
+        my $tmp_reg;
+        if(($current_registry > 0) && ($current_registry != ($tmp_reg = getRegistry(ipv4_quaddot_to_decimal($network))))){
+            $log->log(level=>'warning', message=>"whois field from IANA IPv4 address space registry does not equal " .
+                                                 "the current one: $current_registry --- $tmp_reg, " .
+                                                 "$netRange --- $network; comment: $comment\n");
+            return $numlines if($SKIP_UNMATCHED); # should we insert this block into database ?
+        }
+
+        if(1 == $found){
+            $orgId = $org_id_1 if(defined($org_id_1) && (0 == $org_attr_exists));
+            $update_netblock_rpsl_sth->execute($netHandle, $orgName, $orgId, $parent, $netName, $netRange,
+                                          ipv4_quaddot_to_decimal($network), ipv4_quaddot_to_decimal($enetrange), $netType, $regDate, $comment, $updDate,
+                                          $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3],
+                                          $nocHandle, $abuseHandle, $techHandle, $source, $cacheDate, $mailbox, $id)
+                                          or die "Can't update record: $DBI::errstr";
+            $update_netblock_rpsl_sth->finish();
+        }
+        else{
+            checkOrganisationByOrgId($orgId, $orgName, "", "", $source, $cacheDate);
+            $insert_into_netblock_rpsl_sth->execute($netHandle, $orgName, $orgId, $parent, $netName, $netRange,
+                                               ipv4_quaddot_to_decimal($network), ipv4_quaddot_to_decimal($enetrange), $netType, $regDate, $comment, $updDate,
+                                               $nameservers[0], $nameservers[1], $nameservers[2], $nameservers[3],
+                                               $nocHandle, $abuseHandle, $techHandle, $source, $cacheDate, $cacheDate, $mailbox)
+                                               or die "Can't insert record: $DBI::errstr";
+            $insert_into_netblock_rpsl_sth->finish();
+        }
+    }
+    return $numlines;
+}
+
+# ------------------------------------------------------------------------
+# parsing RPSL databases
+# thanks to Claus Marxmeier for writing first version and contributing
+# Thanks to Sergey Parygin for updating to support RPSL2 format and working to test all other registries
+#
+# parameters: number of skipped object
+#
+# return: ($errcode, $number_of_objects)
+#
+# ------------------------------------------------------------------------
+sub readRpslUpdate
+{
+	my $class = shift;
+	my $src = shift;
+    my $errcode = 0;
+    my $objnum = 0;
+    my $numlines = 0;
+    my $fd;
+    my $line;
+    my $number_of_line = 0;
+    my $numskip = $opt{'skip'};
+    my ($attr, $value);
+    my $dumpFileName = $opt{'infile'};
+    my $cacheDate = time();
+    my $now;
+
+    return (-1, 0) if(!defined($dumpFileName));
+	return (-1, 0) if(!defined($src));
+
+    $numskip = 0 if(!defined($numskip));
+    $objnum = $numskip;
+
+    open($fd, "<", $dumpFileName) or die "Error opening file $dumpFileName: $!";
+
+    while(($line = readline($fd))) # && ($test_obj < 100))
+    {
+        $number_of_line++;
+
+        if(($line =~ m/^[[:space:]]*$/) || ($line =~ m/^[[:space:]]*#.*$/))
+        {
+            next;
+        }
+
+        if($numskip > 0){
+            $number_of_line += skipDataBaseObject($fd);
+            $numskip--;
+            next;
+        }
+
+        if(($attr, $value) = ($line =~ m/^([^:]+):(.+)$/)){
+
+            if('as-block' eq lc($attr)){
+                # as-bloc --- delegetion of a range of AS numbers to a given RIR
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('as-set' eq lc($attr)){
+                # as-set --- set of aut-num objects
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('aut-num' eq lc($attr)){
+                # aut-num --- autonomous system (AS) in the database. it describe the external routing policy of the AS
+                if(0 < ($numlines = parseAutNumObject($fd, $value, $cacheDate))){
+                    $number_of_line += $numlines;
+                }
+                else{
+                    $log->log(level=>'warning', message=>"line $number_of_line, error parsing $attr object\n");
+                    $number_of_line -= $numlines;
+                }
+                #$test_obj++;
+            }
+            elsif('domain' eq lc($attr)){
+                # domain --- forward or reverse domain registrations
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('filter-set' eq lc($attr)){
+                # filter-set --- set of router matched by its filter
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('inet6num' eq lc($attr)){
+                # inet6num --- allocations and assignments of IPv6 address space
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('inetnum' eq lc($attr)){
+                # inetnum --- allocations and assignments of IPv4 address space
+                if(0 < ($numlines = parseInetnumObject($fd, $value, $cacheDate))){
+                    $number_of_line += $numlines;
+                }
+                else{
+                    $log->log(level=>'warning', message=>"line $number_of_line, error parsing $attr object\n");
+                    $number_of_line -= $numlines;
+                }
+                #$test_obj++;
+            }
+            elsif('inet-rtr' eq lc($attr)){
+                # inet-rtr --- router in the database
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('irt' eq lc($attr)){
+                # irt --- contact and authentication information about a CSIRT
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('key-cert' eq lc($attr)){
+                # ley-sert --- public key certificate that is stored on the server
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('mntner' eq lc($attr)){
+                # mntner --- autentication information needed to authorise creation, deletion or modification of the
+                #            objects protected by the mntner
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('organisation' eq lc($attr)){
+                # organisation --- organisation that holds the resources
+                #$log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                #$number_of_line += skipDataBaseObject($fd);
+                if(0 < ($numlines = parseOrganisationObject($fd, $value, $cacheDate))){
+                    $number_of_line += $numlines;
+                }
+                else{
+                    $log->log(level=>'warning', message=>"line $number_of_line, error parsing $attr object\n");
+                    $number_of_line -= $numlines;
+                }
+                #$test_obj++;
+            }
+            elsif('peering-set' eq lc($attr)){
+                # peering-set --- set of peering
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('person' eq lc($attr)){
+                # person --- technical or administrative contact
+                if(0 < ($numlines = parsePersonObject($fd, $value, $cacheDate))){
+                    $number_of_line += $numlines;
+                }
+                else{
+                    $log->log(level=>'warning', message=>"line $number_of_line, error parsing $attr object\n");
+                    $number_of_line -= $numlines;
+                }
+                #$test_obj++;
+                #$log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                #$number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('poem' eq lc($attr)){
+                # poem --- humorous poem
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('poetic-form' eq lc($attr)){
+                # poetic-form --- type of humor for a poem object
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('role' eq lc($attr)){
+                # role --- technical or administrative contacts -- describe a role performed by one or more people
+                # person --- technical or administrative contact
+                if(0 < ($numlines = parseRoleObject($fd, $value, $cacheDate))){
+                    $number_of_line += $numlines;
+                }
+                else{
+                    $log->log(level=>'warning', message=>"line $number_of_line, error parsing $attr object\n");
+                    $number_of_line -= $numlines;
+                }
+                #$log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                #$number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('route' eq lc($attr)){
+                # route --- IPv4 route advertised on the internet
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('route6' eq lc($attr)){
+                # route6 --- IPv6 route advertised on the internet
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('route-set' eq lc($attr)){
+                # route-set --- set of routes
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            elsif('rtr-set' eq lc($attr)){
+                # rtr-set --- set of routes
+                $log->log(level=>'debug', message=>"line $number_of_line, object $attr\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            else{
+                $log->log(level=>'warning', message=>"line $number_of_line, unknown object: $attr, value: $value\n");
+                $number_of_line += skipDataBaseObject($fd);
+            }
+            $objnum++;
+            $now = localtime(time());
+            $log->log(level=>'debug', message=>"$now: number of objects: $objnum\n");
+            if(!defined($opt{'display-only'}) and ($objnum % $DEFAULT_RECORD_DB_CHUNK_SIZE == 0)){
+                $dbh->commit() or warn "Can't commit records: $DBI::errstr";
+                $log->log(level=>'info', message=>"number of objects: $objnum\n");
+            }
+        }
+    }
+
+    close($fd);
+
+	if(!defined($opt{'display-only'})) {
+		$log->log(level=>'info', message=>"marking source $src\n");
+		$update_netblock_expired_sth->execute($src,$cacheDate) or warn "Can't update netblock records: $DBI::errstr";
+		$update_netblock_expired_sth->finish();
+		$dbh->commit() or warn "Can't commit records: $DBI::errstr";
+	}
+
+    return ($errcode, $objnum);
+}
+
+# ------------------------------------------------------------------------
+# ***********  end of RIPE Database parsing function  ********************
+# ------------------------------------------------------------------------
+
+my $app = new Pwhoisd();
+my $src;
+
+# lock
+singleton_lock($locks{parse});
+
+if(defined($opt{'whois-source'})){
+	$src = $sources{lc($opt{'whois-source'})};
+	$log->log(level=>'info', message=>"Got source $opt{'whois-source'} ($src)\n");
+}
+
+if(defined($opt{'import-whois-dump'})){
+	$src = $sources{'arin'} if !defined($src);
+	$app->readWhoisUpdate($src);
+}
+elsif(defined($opt{'import-rpsl-dump'}) or defined($opt{'import-rpsl2-dump'})){
+    # lets try to import RPSL (ripe, apnic, jpnic, twnic, radb)
+	  # import rpsl dump
+
+    if(defined($opt{'registry-xml'})){
+        $current_registry = defCurrentRegistry($opt{'infile'});
+
+        parseIANASpaceRegistry($opt{'registry-xml'});
+
+        $log->log(level=>'info', message=>"IANA IPv4 Registry: $opt{'registry-xml'}, current reg: $current_registry\n");
+
+        for(@iana_net){
+            $log->log(level=>'info', message=>"net: $_, " . ($_ >> 24) . "; reg: $iana_reg{$_}\n");
+        }
+
+        printMap(%iana_reg);
+    }
+
+    my ($errcode, $objnum) = $app->readRpslUpdate($src);
+    $log->log(level=>'info', message=>"RPSL dump parsing returned code: $errcode; number of parsing objects: $objnum\n");
+
+}
+elsif(defined($opt{'import-mrt-dump'})){
+    # import mrt dump
+    my ($errcode, $recnum) = $app->readMRTdump();
+    $log->log(level=>'info', message=>"MRT dump parsing returned code: $errcode; number of parsing records: $recnum \n");
+}
+else {
+    # processing standard log
+    $app->readBgpUpdate();
+}
+
+# unlock
+singleton_unlock($locks{parse});
+
+

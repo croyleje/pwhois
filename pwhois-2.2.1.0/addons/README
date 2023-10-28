@@ -1,0 +1,75 @@
+Prefix WhoIs Milter
+
+
+The Prefix WhoIs Milter is a mail filter for Postfix and Sendmail.  It queries
+Prefix WhoIs (whois.pwhois.org by default) about the originating IP address
+found in the final Received or X-Originating-IP mail header.  The information
+that it returns may be used for greylisting and can be displayed in modern
+e-mail clients to provide some background as to the origin of the message.
+
+The Prefix WhoIs milter appends e-mail headers of the form X-PWhois-Field-Name
+corresponding to a field in the response from Prefix WhoIs.  Currently, it
+inserts information from the Origin-AS, AS-Org-Name, Org-Name, Net-Name, Region,
+Country and Country-Code Prefix WhoIs response fields.
+
+The PWhoIs Milter turns boring e-mail headers like this:
+
+To: "You" <you@example.com>
+From: "John Doe" <johndoe@example.com>
+
+... into useful message headers like this:
+
+To: "You" <you@example.com>
+From: "John Doe" <johndoe@example.com>
+X-PWhois-Origin: 4.2.2.1
+X-PWhois-Origin-AS: 3356
+X-PWhois-AS-Org-Name: Level 3 Communications
+X-PWhois-Org-Name: Level 3 Communications, Inc.
+X-PWhois-Net-Name: LVLT-ORG-4-8
+X-PWhois-City: BROOMFIELD
+X-PWhois-Region: COLORADO
+X-PWhois-Country: UNITED STATES
+X-PWhois-Country-Code: US
+
+The Prefix WhoIs milter implements a safety timeout in case of a network or
+Prefix WhoIs outage; if the timeout period elapses, the message passes through
+unaltered and without further delay, so it is safe to run even in high-volume
+e-mail environments.
+
+
+Installation Instructions
+
+Libmilter is required to build pwhois-milter.  This is often available in
+package repositories, such as libmilter-dev for Debian, or you may wish to use
+libmilter from the Sendmail source distribution.  Then, simply issue
+
+# make && make install
+
+and copy the init script corresponding to your system to the proper location.
+
+
+Usage Hints and Tips
+
+Add to your Postfix main.cf smtpd_milters chain:
+
+inet:localhost:8472
+
+If you have existing milters in your Postfix milter chain, separate them with a
+comma or space.  Neither Postfix nor Sendmail will start pwhois-milter for you
+so you must run the appropriate init script for your system.  Alternatively, you
+may wish to run the milter manually:
+
+pwhois-milter -i /path/to/pidfile.pid -l /path/to/logfile.log [ -u UID -g GID ]
+
+View further command line options by running pwhois-milter with no parameters.
+
+Although pwhois-milter has not been tested with Sendmail, it ought to work if
+you add the following to your sendmail.mc:
+
+INPUT_MAIL_FILTER(`PWhois Milter', `S=inet:8472@localhost, T=E:10s')
+
+Signal pwhois-milter with SIGUSR1 to reopen the log file for rotating logs.
+(SIGHUP will terminate the milter.)  Preferably configure logrotate(8) or
+touch(1) the log file to create it before instructing pwhois-milter to use it.
+It may not be able to create the file on its own since it should be running with
+limited privileges.

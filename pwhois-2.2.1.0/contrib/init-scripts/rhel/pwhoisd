@@ -1,0 +1,124 @@
+#!/bin/bash
+#
+#  pwhoisd	This starts and stops pwhoisd 
+#
+# chkconfig: 2345 11 88
+# description: This starts the Prefix WhoIs Server \ 
+#              which serves up prefix (routing) and registry information \
+#	       from a database system aggregated from various sources
+#
+# processname: /usr/local/sbin/pwhoisd
+# config: /etc/pwhois/pwhoisd.conf
+# pidfile: /var/run/pwhoisd.pid
+#
+# Return values according to LSB for all commands but status:
+# 0 - success
+# 1 - generic or unspecified error
+# 2 - invalid or excess argument(s)
+# 3 - unimplemented feature (e.g. "reload")
+# 4 - insufficient privilege
+# 5 - program is not installed
+# 6 - program is not configured
+# 7 - program is not running
+#
+
+DAEMONOPTS="-d -v -l /var/log/pwhoisd.log --pidfile /var/run/pwhoisd.pid"
+PATH=/usr/local/sbin
+prog="pwhoisd"
+
+# Source function library.
+. /etc/init.d/functions
+
+# Allow anyone to run status
+if [ "$1" = "status" ] ; then
+        status $prog
+        RETVAL=$?
+        exit $RETVAL
+fi
+
+# Check that we are root ... so non-root users stop here
+test $EUID = 0  ||  exit 4
+
+# Check config
+test -f /etc/pwhois/pwhoisd.conf
+
+RETVAL=0
+
+# allow core files
+ulimit -c unlimited
+
+start(){
+        test -x /usr/local/sbin/pwhoisd || exit 5
+        test -f /etc/pwhois/pwhoisd.conf || exit 6
+
+        echo -n $"Starting $prog: "
+        daemon /usr/local/sbin/pwhoisd "$DAEMONOPTS"
+        RETVAL=$?
+        echo
+        return $RETVAL
+}
+
+stop(){
+        echo -n $"Stopping $prog: "
+        killproc $prog
+        RETVAL=$?
+        echo
+        rm -f $PIDFILE 
+        return $RETVAL
+}
+
+reload(){
+        test -f /etc/audit/auditd.conf  || exit 6
+        echo -n $"Reloading configuration: "
+        killproc $prog -HUP
+        RETVAL=$?
+        echo
+        return $RETVAL
+}
+
+reload_acl(){
+        echo -n $"Reloading ACL: "
+        killproc $prog -USR1
+        RETVAL=$?
+        echo
+        return $RETVAL
+}
+
+restart(){
+        test -f /etc/pwhois/pwhoisd.conf || exit 6
+        stop
+        start
+}
+
+condrestart(){
+        [ -e /var/lock/subsys/auditd ] && restart
+        return 0
+}
+
+
+# See how we were called.
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    reload)
+        reload
+        ;;
+    reload_acl)
+        reload_acl 
+        ;;
+    condrestart)
+        condrestart
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|status|restart|condrestart|reload|}"
+        RETVAL=3
+esac
+
+exit $RETVAL

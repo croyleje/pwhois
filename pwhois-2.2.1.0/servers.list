@@ -1,0 +1,46 @@
+Here is a list of servers which support the "Cisco" style output ("pretty printed routing table"), for which pwhois-updatedb can parse
+directly over a telnet connection to that router/routeview server.
+
+This list mostly is taken from the Route Views Project page available at:
+
+	http://www.routeviews.org/
+
+Thanks to the fine people that run the University of Oregon Route Views Project, this is all possible.
+
+
+Server/IP				Port  System	Type/Routes			   Location
+route-views.routeviews.org		23    Zebra	IPv4 uni/multi-cast multihop	   U of Oregon, (Eugene OR, USA)
+route-views2.routeviews.org		23    Zebra	IPv4 uni/multi-cast multihop	   U of Oregon, (Eugene OR, USA)
+route-views.eqix.routeviews.org		23    Zebra 	IPv4/v6	(Only IPv4 are parseable)  Equinox, (Ashburn, VA, USA)
+route-views.isc.routeviews.org		23    Zebra 	IPv4 uni/multi-cast		   ISC (PAIX), (Palo Alto, CA, USA)
+route-views.linx.routeviews.org		23    Zebra 	IPv4/v6 uni/multi-cast		   LINX, (London, GB)
+route-views.wide.routeviews.org		23    Zebra	IPv4/v6 uni/multi-cast		   DIXIE (NSPIXP), (Tokyo, JP)
+
+
+You might also try to download the BGP routing table (cisco "show ip bgp" format), from a mirror or archive server 
+and load into the database using the command:
+
+	pwhois-updatedb -r <id_of_router> -i <filename>
+
+In the future PWHOIS may be able to read the MTR format or other formats (Juniper).
+
+The Route Views Project also maintains archives of all the data and makes it available at:
+
+	http://archive.routeviews.org/oix-route-views/
+
+Ex. (see contrib/doloop/pwhois-snapshot-reload)
+
+	#!/bin/sh
+	ROUTER_ID=128.223.60.103
+	YEAR=`date "+%Y"`
+	MONTH=`date "+%m"`
+	
+	if [ -f /var/pwhois/oix-full-snapshot-latest.dat ]; then
+		rm /var/pwhois/oix-full-snapshot-latest.dat;
+	fi
+	
+	cd /var/pwhois
+	wget http://archive.routeviews.org/oix-route-views/$YEAR.$MONTH/oix-full-snapshot-latest.dat.bz2
+	bunzip2 /var/pwhois/oix-full-snapshot-latest.dat.bz2
+	/usr/sbin/pwhois-updatedb -i /var/pwhois/oix-full-snapshot-latest.dat -r $ROUTER_ID -v -l /var/log/pwhois-updatedb.log
+	rm /var/pwhois/oix-full-snapshot-latest.dat

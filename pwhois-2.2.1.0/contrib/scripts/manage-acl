@@ -1,0 +1,49 @@
+#!/bin/bash
+PWDUMP_DIR=/data/tmp
+
+uid="`id -u`"
+[[ "$uid" != "0" ]] && echo "Not running as root: cannot reload pwhoisd ACL!"
+
+echo "Each access to the database requires entry of the database password."
+echo "Current ACL entries:"
+while ! mysql -u pwhois -p pwhois -e "SELECT id, INET_NTOA(ip) AS network, cidr, FROM_UNIXTIME(createdate) AS create_date, FROM_UNIXTIME(modifydate) AS modify_date, status, max_count, comment FROM pwhois_acl ORDER BY ip;"
+do
+	read -p "Bad password!  Abort with Ctrl-C, or Enter to try again? " || exit 1
+done
+
+while true ; do
+read -p "Actions: [C]reate, [D]elete, [M]odify, other to quit.  Choice: "
+case "$REPLY" in
+	c)	read -p "Network: " network
+		read -p "CIDR: " cidr
+		read -p "Status (0 deny, 1 allow, 2 extra, 3 hidden, extra): " status
+		read -p "Max count: " max_count
+		read -p "Comment: " comment
+		mysql -u pwhois -p pwhois -e "INSERT INTO pwhois_acl SET ip = INET_ATON('$network'), cidr = '$cidr', createdate = UNIX_TIMESTAMP(), modifydate = UNIX_TIMESTAMP(), status = '$status', max_count = '$max_count', comment = '$comment'"
+		;;
+	d)	echo "Note: Deletion of an entry loaded into pwhoisd requires a restart."
+		echo "It may be sufficient to modify an entry, reload, then delete."
+		read -p "ID: "
+		mysql -u pwhois -p pwhois -e "DELETE FROM pwhois_acl WHERE id=$REPLY"
+		;;
+	m)	read -p "ID: " id
+		read -p "Network: " network
+		read -p "CIDR: " cidr
+		read -p "Status (0 deny, 1 allow, 2 extra, 3 hidden): " status
+		read -p "Max count: " max_count
+		read -p "Comment: " comment
+		mysql -u pwhois -p pwhois -e "UPDATE pwhois_acl SET ip = INET_ATON('$network'), cidr = '$cidr', modifydate = UNIX_TIMESTAMP(), status = '$status', max_count = '$max_count', comment = '$comment' WHERE id='$id'"
+		;;
+	*)	break;;
+esac
+done
+
+if [[ "$uid" == 0 ]]
+then
+	echo "Reloading ACL:"
+	pwhois-pwdump -a
+	mv $PWDUMP_DIR/acl.pwdump{.tmp,}
+	kill -USR1 `cat /var/run/pwhoisd.pid`
+else
+	echo "Reminder: run as root to update ACL."
+fi

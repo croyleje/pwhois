@@ -1,0 +1,240 @@
+##################################################
+# PWHOIS Revision History
+##################################################
+
+2.2.1.0:
+
+Added routeview transit-as query type.
+
+2.2.0.0:
+
+Decoupled pwhoisd from the database and now it relies solely on binary cache
+files that it loads into memory to satisfy queries.  More data is available for
+standard queries qualified with type=all.  See the help text for new queries;
+netblock queries by net-name and net-handle have been dropped.  Corrected
+multiplier for 32-bit ASNs: users should update ASNs in any existing bgp_routes
+table before upgrading by using mysql/updateasns.sql.  Added a CIDR field to the
+ACL table to accommodate network blocks.  Apply this change to existing ACL
+tables using mysql/updatepwhoisacl.sql.  Bugfixes for ACL and accept() failure.
+Added a CSV logging option (-R,--report) and Country-Code field in standard
+whois output.  The version command now reports the correct server start date.
+
+2.1.0.0:
+
+Migrated to MySQL.
+
+2.0.21.56:
+
+Changes in the output of the CYMRU (Column) format (type=cymru 4.2.2.1) 
+to include the Org-Name and Net-Name values.  The AS-Org-Name was already 
+being shown buthis is now explicitly labelled AS ORG NAME in the header 
+to make the distiction.
+
+Added syslog logging to LOCAL1 facility to allow log files to be more 
+easily rotated without requiring a restart. To activate syslog support,
+use the 'pwhoisd.logfile=syslog' configuration attribute in pwhois.conf
+
+
+2.0.21.55:
+
+Problem with RIPE and other RPSL(2) formats was found.  pwhois-updatedb 
+incorrectly choose a nethandle value which was not unique enough given 
+the data.  This routine now creates a more unique nethandle by 
+combining the starting IP with the CIDR value for the ending range IP 
+in a textual format.  The purpose of the nethandle is only to be consistent 
+with the ARIN data format, where the user creates a netblock record within 
+their system and when this happens, it creates a unique nethandle value.  
+In the RPSL format, there is no such value (and unique ID other than the 
+prefix range values themselves).
+
+To correct your existing data, please uses the 
+postgresql/fix_nethandles.pl script before your next load of RPSL 
+formatted data.  this will automatically update records in your database 
+that are marked as source > 1 (not ARIN).  This will take some time to 
+execute though, so please be patient.  Then of course restart your 
+PwhoisD after doing this.
+
+-- 
+
+Introduced is the Fast Load feature.  PwhoisD now in fastload mode 
+(see pwhoisd.conf) will read database extract files in a standard 
+location (usually /var/pwhois) and will load the data tree without the 
+complex database interation and reorganization.  Use the preppwdump 
+utility to extract data from the database and generate this files.
+ 
+pwhoisd will reload the data in memory from these files on a SIGHUP.  
+The major benfit here is pwhoisd can stay online serving clients during 
+the reload process, since reloading can be done offline now causing a 
+very small outgage only while it reloads the data -- a few seconds, not 
+many minutes or even hours.
+
+There is a script in contrib/fastload.sh that you can use to 
+automatically download new pwdumps and then signal pwhoisd when they are 
+done/complete.
+
+
+2.0.20.54:  Added a version number check/startup routine to read the 
+pwhois.db entry in the version table so decisions can be made about how 
+to execute queries, for backward compatibility.  Changed the loadArin 
+routine to use a new column in the database which is the enetrange field.  
+This change causes a DDL change and now there are two versions of this 
+routine to load the database in different ways based upon version or now 
+version 4 of the database model.  Added a v3tov4.sql upgrade script to 
+help users convert between verson 3 and version 4 of the database model 
+see postgresql/updatedbv3tov4.sql script for more details.  This version 
+also cleans up a few minor logging things as well as fixes a synch bug 
+related to the use of inet_ntoa.
+
+2.0.20.53:  Changed the memory allocator to display allocated memory in 
+the type=all statistics output to help diagnose a crash issue and see memory 
+consumption
+
+Also, pwhois-updatedb was changed to support the RPSL(2) formats.  Also 
+the MRT formated dump files from quagga/zebra BGP route servers can be 
+imported.
+
+2.0.19: changed pwhois_thread to work around a Linux specific socket 
+timeout option
+
+2.0.18:
+
+2.0.17: Updated the socket timeout to 10 seconds (from 1 second) for 
+longer lived requests.  Problems with whob -a was causing disconnections 
+sometimes.
+
+2.0.16: Updated Regex parsing code to allow app= tags for backward 
+compatibility with whob 2.0, which sends the app= tag when using the -a option
+
+2.0.15: Added a type=all option for registry queries which will display 
+a short version of the POC handle information inline with the other 
+registry information.  This makes our output more conformant with other 
+WHOIS servers and avoids additional calls to the server when the user 
+is looking for the POC's contact information.  This may become the default 
+option at some point and may have to specify via 'type=minimal' or 
+something like that to not get the POC handle's contact info.  This 
+costs 4 extra database queries to get the info inline.  
+
+2.0.14: Rewrite of pwhoisd in C.  Removal of the ACL restrictions of on 
+advanced queries,  See "help" command.
+  Implementation of GEO resolution.  Some additional scripts in contrib 
+directory for managing public global PWHOIS servers.
+  
+1.5.1: It was determined that PWHOIS was incorectly (or imprecisely) 
+returning the Origin-AS's ORG-NAME  regardless if that network's ORG-NAME 
+was, based upon the associated of the Org-Name and Org-ID through the 
+Netblock, not through the AS who is announcing the block.  This happens 
+when a block is swip'd to annother org, but the organization does not 
+announce their block directly.  The existing AS announced Org-Name is 
+returned in a new AS-Org-Name field, and the swiped Org-Name or whatever 
+is available through the Org-ID reference this is returned now in the 
+existing and current Org-Name field.  THIS COULD BREAK YOUR APPLICATION, 
+if you were expecting the AS-specific Org-Name in the Org-Name field.  
+Please use the AS-Org-Name field now for this purpose.
+
+If you have any questions about this, please email as at pwhois-team@pwhois.org
+
+1.5.0: Added support for WHOIS data via ARIN data extract
+
+With support from ARIN, for research purposes only, the PWHOIS project
+was able to receive an extract of the ARIN WHOIS database for inclusion in
+limited and regulated quantities along side prefix-based whois information (
+when served by our global PWHOIS servers).  
+
+	whois -h whois.pwhois.org  <IP>
+
+We've agreed to only provide this information for research purposes and must
+limit access to the system from automated software programs, etc. to prevent
+harvesting.  For this reason the WHOIS database itself is not included in the
+open-source archives or extracts, and if you wish to run your own copy of the
+PWHOIS server with this WHOIS data available, you must request access to it 
+directlyfrom ARIN, and we can not be liable for any mishandling or misuse of 
+this information
+under your control.
+
+Once you've received access, see the pwhois-updatedb --import-whois-dump 
+command-lineoption for instructions on how to import the data into the database.
+Some changes to the database were required to store this information and make 
+it available to the PWHOIS server.
+
+The standard queries, ex.  './pwhois 4.2.2.1' will now return the Net-Name, and
+Org-Name (if available).  Since we now have this data, many of the other formats
+(cymru, rpsl, and pwhois) were changed to be more compatible with the original 
+servicesand cymru (for example) should now be identical to the Cymru format 
+available from whois.cymru.com, especially when used in bulk mode.
+
+The WhoB client library and LFT have been concurrently revised to take advantage 
+of this newfeature.  These applications are released separate from the same 
+website.
+
+Upgrading from 1.0.X:
+
+The database schema changed between versions 1.0.X and 1.1.  To support this 
+change,we recommend you simply drop your pwhois database (using the database 
+specific commands you might use), and then import the new database schema using 
+the install script (install.sh), or manually (see the mysql or postgresql 
+directories in the distribution).
+
+
+1.0.4: Modified some advanced features to required access in the ACL table
+
+To support the 1.4 release of LFT, which has the ability to query for
+some of the advanced (but still experiemental) features of PWHOIS, we have
+decided to make the advanced features require access, so we can prevent
+performance degradation of the regular prefix-based queries until we can
+rewrite the server so these requests are non-blocking.
+
+If you have a legitimate need to use these features, we suggest you setup
+your own PWHOIS server and query against that to your hearts content.  Just
+add your source IP address to the ACL table with a value of 2 or higher. 
+
+1.0.3: More bug fixes
+
+Improved the statistics output via the 'version' command.
+
+Improved updatedb program so that it can properly read wrapped "show ip bgp" 
+formattedfiles that are downloaded via the --display-only or from a archive 
+server, and areread in via the -i option.
+
+Cleaned up documentation, updated the programs to select the specific fields 
+insteadof using a SELECT * for some of the queries, and added a small script 
+pwhois-getarchive.shto download an archive of the "show ip bgp" output from 
+the routeviews.org archive server.  See servers.list for more details. 
+
+1.0.2: More Bug fixes
+
+Cleaned up common code that was duplicated in multiple places in pwhoisd.  
+Cleanedup help documentation.  Changed the pwhois and pwhois-updatedb process 
+to properlyhandle the router_id field in the database and still function 
+properly when loading data from more than one datasource.  Added option for 
+the configuration file,
+
+pwhois.router-id=<IP> so the server can provide a view of the data for the
+Forwarding Information Base (FIB), instead of getting confused and having the last
+records loaded win.
+
+pwhois-updatedb now has a --routerid option to support telling the process what the
+router-id should be when loading from a file, where it would have no idea.  It use to
+use the value of zero, and still will if you don't specify.  This is fine if you only
+have one data source, but isn't fine when you have more than one.
+
+1.0.1: Bug fixes
+
+Changed the pwhois-updatedb process to make it more robust in handling different
+prompts and data that come back from the route servers.  It still has a ways to
+go, but should work properly in most cases.  Fixed problem in previous version
+which caused extra DNS lookups to occur inside the parse update code.
+
+Also fixed minor problem when an IP isn't in the FIB, pwhoisd would display the
+time in the output string of the request from the client versus showing the time
+the data was last updated.
+
+1.0.0:  First major release
+
+Supports the basic functionality and features to search for the most specific
+origin-AS given an IP address and a snapshot of the global internet routing table,
+which is usually only (up to) 4 hours old.  Supports pwhois, Cymru and RPSL
+output formats as well as bulk input/output.
+
+Has a basic access control list mechanism to limit queries by IP address,
+should someone be abusing the service.
+

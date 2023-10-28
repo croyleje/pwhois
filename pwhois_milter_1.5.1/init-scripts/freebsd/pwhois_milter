@@ -1,0 +1,55 @@
+#!/bin/sh
+
+# PROVIDE: pwhois_milter
+# REQUIRE: DAEMON cleanvar
+# BEFORE: postfix
+
+. /etc/rc.subr
+
+name="pwhois_milter"
+rcvar="`set_rcvar`"
+pidfile="/var/run/${name}.pid"
+logfile="/var/log/${name}.log"
+uid=65534
+gid=65534
+command="/usr/local/bin/${name}"
+command_args="-i $pidfile -l $logfile -u $uid -g $gid"
+sig_reload="USR1"
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+
+load_rc_config $name
+
+pwhois_milter_start()
+{
+	if checkyesno "$rcvar"
+	then
+		if [ -f "$pidfile" ] && ps -cp "`cat "${pidfile}"`" | grep "$name"
+		then
+			echo "Already running?"
+		else
+			echo "Starting $name"
+			touch "$logfile"
+			chown ${uid}:${gid} "$logfile"
+			"$command" $command_args
+		fi
+	fi
+}
+
+pwhois_milter_stop()
+{
+	if checkyesno "$rcvar"
+	then
+		if [ -f "$pidfile" ]
+		then
+			echo "Terminating $name"
+			kill "`cat "$pidfile"`"
+			rm "$pidfile"
+			echo "Please wait at least 5 seconds before restarting."
+		else
+			echo "Not running"
+		fi
+	fi
+}
+
+run_rc_command "$1"

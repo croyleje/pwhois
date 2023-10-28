@@ -1,0 +1,130 @@
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+ ######   #     #  #     #  #######  ###   #####   
+ #     #  #  #  #  #     #  #     #   #   #     #  
+ #     #  #  #  #  #     #  #     #   #   #        
+ ######   #  #  #  #######  #     #   #    #####   
+ #        #  #  #  #     #  #     #   #         #  
+ #        #  #  #  #     #  #     #   #   #     #  
+ #         ## ##   #     #  #######  ###   #####   
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+##################################################
+# About
+##################################################
+
+Prefix WhoIs displays the origin-as and other interesting information
+related to the most specific prefix currently advertised within the
+Internet's global routing table that corresponds to the IP address in
+your query. This package provides two main components to make this
+possible.  
+
+  1) The 'pwhois-updatedb' program downloads the global routing table 
+from a router or route-view server of your choosing and stores this data
+in a MySQL database -- approaching 500,000 prefixes, and over 13 million unique
+entries (from some route-views.)  With a cron script this 
+data can be updated at an interval of your choosing, however we recommend 
+not more frequent than every 4 hours (to be considerate of the route-view 
+server from which you pull the data).  pwhois-updatedb is smart enough
+to merge the data and expire records that are no longer in the global
+routing table, so this provides some limit to the amount of disk space you
+will need.
+	
+  2) The 'pwhoisd' server process serves up this information to clients over 
+the whois protocol (port 43/tcp).  In addition, the pwhoisd daemon supports 
+some new query types and output formats including its own internal pwhois 
+format, Team Cymru's output format (see www.cymru.com), and RPSL (RFC 2622) 
+for further compatibility.
+
+pwhoisd also supports bulk queries for integration with other processes, 
+including Layer Four Traceroute (LFT), which is popular with network engineers. 
+See www.pwhois.org for more details.
+
+Obviously, any whois client that supports the ability to supply your own
+whois server to query is compatible with pWhoIs.
+
+This package is most useful with our own whois client, called WhoB, and
+associated whois client library, released separately.  We encourage the use 
+of this client with the pWhoIs server package for the most benefit.
+
+For more information, please visit:
+
+	http://www.pwhois.org/
+
+Once you have your pWhoIs server running, for additional information about
+the features and functions of the server, try executing the command:
+
+	whois -h <your_pwhois_server_ip> help
+
+
+##################################################
+# System Requirements:
+##################################################
+
+The global routing table is large, over 480,000 prefixes at present, and
+in order to achieve fast performance with the server process, this information
+is cached in memory in a patricia tree.  BE FOREWARNED: You may require as much 
+as 12GB of RAM to run both the pwhoisd and pwhois-updatedb programs if you are
+using a full Internet routing table, not including what is required for your
+MySQL database.
+
+
+##################################################
+# Global pWhoIs Service:
+##################################################
+
+The pWhoIs team and fellow good netizens also maintain a global network of 
+pWhoIs servers which provides the best server for answering your queries based 
+upon the distance/location of the client from the DNS server you speak with 
+(your location on the Internet).  This greatly improves the performance of 
+the Global pWhoIs service available at:
+
+	whois -h whois.pwhois.org <query>
+
+UltraDNS is used to provide this 'directional DNS' service.  To learn more about 
+UltraDNS's Directional DNS service, please visit: 
+
+	http://www.ultradns.com/
+
+If you would like to host a node in the global pWhoIs service, given you have
+enough hardware resources and bandwidth, please contact us.
+
+
+##################################################
+# Authors:
+##################################################
+
+This software was primarily developed by a small group of security-minded 
+individuals, who are concerned about the accuracy and availability of data 
+regarding the global Internet routing table.  We conduct research into the 
+security of the Internet and needed this service for our own research.  
+We thought it might be useful to the Internet community as a whole and made 
+it freely available in March, 2005.
+
+Some of these individuals are (and special thanks go to):
+
+	Zachary Kanner
+	Victor Oppleman
+	Robb Ballard
+	Rodney Joffe
+	Brett Watson
+	Troy Ablan
+	Sergey Kondryukov
+	Robert L. Thompson
+
+This PWHOIS global service would not be possible without the hosting and 
+equipment, and corporate support of:
+
+	PureGig
+	UltraDNS
+	CenterGate Research Group
+	VOSTROM Holdings
+	
+##################################################
+# Your Help:
+##################################################
+
+Like we said, this is free software, developed by people that care about what 
+happens on the Internet.  We are not paid to do this.  If you feel you can 
+contribute in some way, we would be happy to hear from you.  Please send your 
+patches, questions, comments, money, beer, coffee, etc.  to pwhois-team@pwhois.org.
+

@@ -1,0 +1,142 @@
+<h1>The Prefix WhoIs Project Software</h1>
+<p>The Prefix WhoIs Project provides a whois-compatible client and server framework
+for disclosing various up-to-date routing information. Instead of using
+registrar-originated network information (which is often unspecific or inaccurate),
+Prefix WhoIs uses the Internet's global routing table as gleaned from a number
+of routing peers around the world.  Other sources of information, such as imported
+data from ARIN are also supported (a separate agreement with ARIN is required).</p>
+<h2>Client Software</h2>
+<ul>
+<li><strong>WhoB</strong> is a command-line whois client customized for network engineers
+(also included as part of <em>Layer Four Traceroute (LFT)</em>)</li>
+<li><strong>Layer Four Traceroute (LFT)</strong> is an advanced path discovery tool whose ASN resolution features rely on
+Prefix WhoIs.  <em>LFT can be found in this repository</em>.</li>
+<li><strong>Prefix WhoIs Milter</strong> is a mail filter for Postfix and Sendmail MTAs.  It
+queries Prefix WhoIs about the originating IP address found in the final Received
+or X-Originating-IP mail headers in incoming e-mails and the information that it
+returns may be used for greylisting and can be displayed in modern e-mail clients
+to provide some background as to the origin of the message.</li>
+<li><strong>Prefix WhoIs Widget</strong> is a simple MacOS X widget that displays the number
+of prefixes present within the global Internet routing table and allows the user
+to submit queries using a familiar Dashboard interface.</li>
+</ul>
+<h2>Server Software</h2>
+<ul>
+<li>The <strong>pWhoIsd server</strong> responds to whois-type queries using a variety of output
+formats including pWhoIs-native, <a href="http://www.cymru.com/BGP/whois.html">Cymru</a>, and
+<a href="http://www.ietf.org/rfc/rfc2622.txt?number=2622">RPSL</a>.</li>
+<li>The <strong>pWhoIs-updatedb</strong> agent parses routing information bases (RIBs) from
+Internet routers or digests from route-views servers and populates a relational
+database.</li>
+</ul>
+<h2>Software Development</h2>
+<p>Libraries Currently, the Prefix WhoIs project distributes vanilla <em>C</em> and <em>PHP</em>
+libraries for direct access to Prefix WhoIs. Our <em>C</em> library is also used by many
+developers to access a plethora of other whois registries as it contains many
+functions to do so. <a href="####C-Lanuage-WhoIs-Library">Library</a></p>
+<ul>
+<li>C Library for pWhoIs
+Full support for pWhoIs in bulk or single queries.  Additionally, this library
+supports many other network-related registrars along with functions to
+automatically recursively dig until you get the information you're looking for.
+The most recent copy of the whois library (whois.c &amp; whois.h) may be found in the
+latest distribution of Layer Four Traceroute.  PHP Library for pWhoIs - Minimal
+support for pWhoIs (work in progress). Requires PHP 5.x (sockets related).  PHP
+Library for RIPE NCC RISwhois - Reasonable support for resolving prefix and other
+information from RIPE NCC's RIS (work in progress).  Requires PHP 5.x
+(sockets related).  3rd Party Developments Involving pWhoIs Many 3rd parties
+develop pWhoIs clients or integrate pWhoIs into their products and services.
+Here are some examples:</li>
+</ul>
+<p>Kevin Tyers maitains a Python library for pWhoIs at https://github.com/dagonis/pwhois
+Avner Herskovits maitains a RESTful proxy for pWhoIs at https://github.com/avnr/p2whois. Keep in mind if you only need JSON output format you can ask the pWhoIs server for it directly using &quot;type=json&quot; or &quot;type=jsonp&quot; per the documentation
+Matt Hersant maitains a PERL library for pWhoIs at https://github.com/mhearse/Net-pWhoIs
+Renato Santos maitains a Ruby client for pWhoIs at https://github.com/p0ngbr/netblock</p>
+<p>Prefix WhoIs Server Software
+Prefix-based whois server for network operators
+Prefix WhoIs displays the Origin-ASN and other interesting information related to the most specific prefix currently advertised within the Internet's global routing table that corresponds to the IP address in your query. This package provides two main components to make this possible:</p>
+<p>The 'pwhois-updatedb' program downloads the global routing table from a router or route-view server of your choosing and stores this data (about 220,000+ prefixes, and over 5 million unique entries (from some route-views)) in a PostgreSQL database. With a cron script this data can be updated at an interval of your choosing, however we recommend not more frequent than every 4 hours (to be considerate of the route-view server from which you pull the data). pwhois-updatedb is smart enough to merge the data and expire records that are no longer in the global routing table, so this provides some limit to the amount of disk space you will need.</p>
+<p>The 'pwhoisd' server process serves up this information to clients over the whois protocol (port 43/tcp). In addition, the pwhoisd daemon supports some new query types and output formats including its own internal pwhois format, Team Cymru's output format (see www.cymru.com), and RPSL (RFC 2622) for further compatibility. pwhoisd also supports bulk queries for integration with other processes, including Layer Four Traceroute (LFT), which is popular with network engineers.</p>
+<p>nstalling and Using pWhoIs Software
+Pre-Installation Hardware Requirements
+If you're planning on loading the entire global routing table from a gateway router (with a full table) or a route-view router or server, please keep in mind that the full table is large--over 220,000+ prefixes at present, and in order to achieve fast performance with the server process, this information is cached in memory in a patricia tree. BE FOREWARNED: You may require as much as 300MB of RAM to run both the pwhoisd and pwhois-updatedb programs if you are using a full Internet routing table, not including what is required for your PostgreSQL database.</p>
+<p>Quick Installation
+After downloading and unarchiving the pWhoIs package, simply execute:</p>
+<p>$ ./install.sh
+... if you have suggestions or code to contribute, please send them to pwhois-support@pwhois.org. Thanks!</p>
+<p>Advanced Installation
+The pWhoIs server and update agent are written mostly in PERL and require a new PERL system (5.6 or later, however 5.8.X is preferrable).</p>
+<p>They also require PostgreSQL 7.X or greater (8.x recommended). The PERL DBD::Pg modules and libpq is required.
+Several other PERL modules are also required. See install.sh</p>
+<p>To install, enter './install.sh' (as root) on the command-line and the installation should commence. It will ask various questions and isn't very robust, but may assist in the process of the install. There are very few components. Should you wish to install manually, it shouldn't be difficult.</p>
+<p>The primary steps are:
+Create the User/Group for the pwhoisd process to run as (e.g., 'pwhois')
+Install the binaries into their permanent locations we like /usr/sbin or /usr/local/sbin
+Setup the init script if warranted (one is provided for a Debian Linux style system)
+Create the database, user/password and import the tables. (See the postgresql/ or mysql/ directories for scripts to create these
+tables and the SQL commands.
+Setup the cron entry to execute the pwhois-updatedb command at a defined interval. A sample crontab file is provided as an example of what we run.
+Edit the pwhoisd.conf configuration file, usually placed in /etc/pwhois/pwhoisd.conf
+Import your first set of data using the pwhois-updatedb command
+Start the pwhoisd server process
+You are now ready to connect to your server and try it out.</p>
+<p>$ whois -h localhost help</p>
+<p>Running pWhoIs Software - Resources
+Example Scripts and Configuration Files
+The following examples are provided in the distribution package:</p>
+<p>Sample startup/init-script: pwhoisd.init
+Sample CRONTAB entry: pwhois.cron
+Sample database config file: pwhoisd.conf
+Sample list of route-view sources: servers.list
+Sample create and initialize examples for PostgreSQL database
+Public Route-View Servers
+The University of Oregon Route Views Project is an excellent source of public information including their collection of route-view servers and RIB digests. The pwhois-updatedb program can download and parse these digests and import them into your database. The following is a list of route-view servers that you may use with pwhois-updatedb:</p>
+<h4>C Lanuage WhoIs Library</h4>
+<p>Our C Library contains the following functions:</p>
+<pre><code class="language-c">#ifndef WHOIS_H
+#define WHOIS_H
+
+struct ip_list_array {
+    struct in_addr ipaddr[1024];
+    int  asn[1024];
+    char netName[1024][32];
+    char orgName[1024][100];
+    char application[1024];
+    int  numItems;
+};
+
+/* must be called BEFORE making any queries */
+void w_init(void);
+
+/* return the origin-asn according to the RADB in &quot;3356&quot; format */
+int w_lookup_as(char *);
+
+/* return the origin-asn according to Cyrmu in &quot;3356&quot; format */
+int w_lookup_as_cymru(char *);
+
+/* return the origin-asn according to the RIPE RIS in &quot;3356&quot; format */
+int w_lookup_as_riswhois(char *);
+
+/* return the origin-asn according to pwhois in &quot;3356&quot; format */
+int w_lookup_as_pwhois(char *);
+
+/* return the network name from the registrar in a string */
+char *w_lookup_netname(char *);
+
+/* return the organization name from the registrar in a string */
+char *w_lookup_orgname(char *);
+
+/* return a pointer to an ip_list_array (see above) containing
+   an 'asn' to each corresponding 'ipaddr' according to Cymru   */
+int w_lookup_as_cymru_bulk(struct ip_list_array*);
+
+/* return a pointer to an ip_list_array (see above) containing
+   all ip_list_array vars to each corresponding 'ipaddr' according to pwhois   */
+int w_lookup_all_pwhois_bulk(struct ip_list_array*);
+
+/* return a pointer to an ip_list_array (see above) containing
+   all ip_list_array vars to each corresponding 'ipaddr' according to RIS whois   */
+int w_lookup_all_riswhois_bulk(struct ip_list_array*);
+
+#endif
+</code></pre>

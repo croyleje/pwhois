@@ -1,0 +1,44 @@
+#!/bin/bash
+YEAR=`date "+%Y"`
+MONTH=`date "+%m"`
+PWDIR=/var/pwhois
+COMP='/bin/bzip2 -fq '
+DECOMP=/bin/gunzip
+DL='/usr/bin/wget -q'
+RELOAD=0
+
+# Parse command line parameters
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -r)  RELOAD=1;;
+	-*)
+            echo >&2 "usage: $0 [-r]"
+	    exit 1;;
+	*)  break;;	# terminate while loop
+    esac
+    shift
+done
+
+# Always keep compressed last copy around in case the transfer fails 
+# This also removes the existing file after compression
+if [[ -r $PWDIR/jpirr.db && -s $PWDIR/jpirr.db ]]; then
+   mv $PWDIR/jpirr.db $PWDIR/former.jpirr.db;
+   /usr/bin/nohup $COMP $PWDIR/former.jpirr.db &
+fi
+
+# Remove older temporary files if they exist (not needed)
+if [ -f $PWDIR/jpirr.db* ]; then
+   rm -f $PWDIR/jpirr.db*;
+fi
+   
+# Download latest file
+cd $PWDIR
+# REMOVED $DL
+$DECOMP $PWDIR/jpirr.db.gz
+
+# Reload import latest data using pwhois-updatedb if user wants
+# and if file size is nonzero 
+if [[ $RELOAD -gt 0 && -s $PWDIR/jpirr.db ]]; then
+   /usr/local/sbin/pwhois-updatedb -i $PWDIR/jpirr.db --whois-source=jpirr --import-rpsl2-dump --registry-xml /var/pwhois/ipv4-address-space.xml -l /var/log/pwhois-updatedb.log
+fi

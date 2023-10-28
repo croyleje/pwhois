@@ -1,0 +1,36 @@
+#!/bin/bash
+
+HOME=/var/pwhois
+sources="ripe arin afrinic apnic twnic jpnic krnic irinn jpirr"
+# lacnic can't be automated yet
+
+function load_whois()
+{
+	local source=$1
+	local last="$HOME/.last{$source}"
+	date
+	echo "$source load"
+	/usr/local/sbin/pwhois-${source}-snapshot-load -r
+	if [[ -f /tmp/.pwhois-updatedb.LCK ]] ; then tail /var/log/pwhois-updatedb.log ; rm -f /tmp/.pwhois-updatedb.LCK ; fi
+	touch $last
+}
+
+touch $HOME/.lastrun
+date
+echo Snapshot load
+/usr/local/sbin/pwhois-snapshot-load
+if [[ -f /tmp/.pwhois-updatedb.LCK ]] ; then tail /var/log/pwhois-updatedb.log ; rm -f /tmp/.pwhois-updatedb.LCK ; fi
+
+# load the whois data based upon the schedule of
+# marked last files which will be stated
+for s in $sources ; do
+	load_whois $s
+done
+
+# if running on the same box, we want to reload pwhoisd now
+	
+#echo pwhoisd reload
+#/etc/init.d/pwhoisd reload
+#kill -1 `cat /var/run/pwhoisd.pid`
+/usr/local/sbin/pwhois-pwdump-prep.sh -r
+date

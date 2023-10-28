@@ -1,0 +1,1 @@
+UPDATE bgp_routes SET asn=asn+FLOOR(asn/65535) WHERE id IN ( SELECT id FROM ( SELECT id,asn,@s:=SUBSTRING_INDEX(asn_paths,' ',-1) AS s,@x:=SUBSTRING_INDEX(@s,'.',1) AS x,@y:=SUBSTRING_INDEX(@s,'.',-1) AS y FROM bgp_routes WHERE asn > 65535 AND asn_paths REGEXP ' [0-9]+\\.[0-9]+$' ) AS b WHERE asn=x*65535+y );

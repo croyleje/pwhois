@@ -1,0 +1,9 @@
+# this script is for RedHat Enterprise Linux (RHEL) or compatible systems, like Fedora and CentOS, etc.
+
+it is fairly new and has not be extensively tested.
+
+Install to /etc/init.d and then add symlinks to the appropriate runlevels, or preferably use the /sbin/chkconfig tool to add it automatically.
+
+cp pwhoisd /etc/init.d/
+/sbin/chkconfig --add pwhoisd
+

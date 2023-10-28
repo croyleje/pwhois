@@ -1,0 +1,27 @@
+#!/bin/bash
+ROUTER_ID=128.223.60.102
+YEAR=`date "+%Y"`
+MONTH=`date "+%m"`
+
+FILENAME=route-views3-full-snapshot-latest.dat
+FILENAME_COMPRESSED="$FILENAME.bz2"
+
+
+if [ -f "/var/pwhois/$FILENAME*" ]; then
+	rm -f "/var/pwhois/$FILENAME*";
+fi
+
+if [ -f "/var/pwhois/$FILENAME_COMPRESSED*" ]; then
+	rm -f "/var/pwhois/$FILENAME_COMPRESSED*";
+fi
+
+cd /var/pwhois
+/usr/bin/wget -q http://archive.routeviews.org/route-views3/$YEAR.$MONTH/$FILENAME_COMPRESSED
+bunzip2 /var/pwhois/$FILENAME_COMPRESSED
+if [ -r "/var/pwhois/$FILENAME" ]; then
+	/usr/local/sbin/pwhois-updatedb -i /var/pwhois/$FILENAME -r $ROUTER_ID -v -l /var/log/pwhois-updatedb.log
+	rm /var/pwhois/$FILENAME
+else
+	echo "Error: no snapshot downloaded";
+	exit -1;
+fi

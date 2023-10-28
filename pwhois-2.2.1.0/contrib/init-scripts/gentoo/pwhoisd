@@ -1,0 +1,44 @@
+#!/bin/sh -e
+#
+# /etc/init.d/pwhoisd
+#
+DAEMONOPTS="-d -v -l /var/log/pwhoisd.log --pidfile /var/run/pwhoisd.pid -u 512"
+# time to wait for daemons death, in seconds
+DODTIME=5
+
+DAEMON=/usr/local/sbin/pwhoisd
+PIDFILE=/var/run/pwhoisd.pid
+NAME=pwhoisd
+LABEL="Prefix Whois daemon"
+
+test -x $DAEMON || exit 0
+
+case "$1" in
+  start)
+    echo -n "Starting $LABEL: "
+    start-stop-daemon --start --pidfile $PIDFILE --exec $DAEMON -- $DAEMONOPTS 
+    echo "$NAME."
+    ;;
+  stop)
+    echo -n "Stopping $LABEL: "
+    start-stop-daemon --stop --pidfile $PIDFILE --oknodo 
+    echo "$NAME."
+      ;;
+  restart)
+    echo -n "Restarting $LABEL: "
+    start-stop-daemon --stop --oknodo --pidfile $PIDFILE
+    sleep "$DODTIME"s
+    start-stop-daemon --start --pidfile $PIDFILE --exec $DAEMON -- $DAEMONOPTS 
+    echo "$NAME."
+    ;;
+  reload|force-reload)
+    echo "Reloading $LABEL configuration files"
+    start-stop-daemon --stop --signal 1 --pidfile $PIDFILE 
+    ;;
+  *)
+    echo "Usage: /etc/init.d/$NAME {start|stop|restart|reload}"
+    exit 1
+    ;;
+esac
+
+exit 0

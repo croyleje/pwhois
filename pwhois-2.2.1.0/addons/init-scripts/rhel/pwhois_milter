@@ -1,0 +1,62 @@
+#!/bin/bash
+#
+# chkconfig: 2345 85 15
+# description: PWhois Milter is a mail filter for Postfix and Sendmail
+#
+# processname: pwhois_milter
+# pidfile: /var/run/pwhois_milter.pid
+
+# To enable and run:
+# $ chkconfig --add pwhois_milter
+# $ chkconfig pwhois_milter on
+# $ /etc/init.d/pwhois_milter start
+
+. /etc/rc.d/init.d/functions
+
+. /etc/sysconfig/network
+[ "${NETWORKING}" = "no" ] && exit 0
+
+NAME=pwhois_milter
+DAEMON="/usr/local/bin/$NAME"
+pidfile="/var/run/${NAME}.pid"
+logfile="/var/log/${NAME}.log"
+uid=65534
+gid=65534
+ARGS="-i $pidfile -l $logfile -u $uid -g $gid"
+DODTIME=5
+
+do_start() {
+	echo -n $"Starting ${NAME}: "
+	touch "$logfile"
+	chown ${uid}:${gid} "$logfile"
+	daemon "$DAEMON" $ARGS
+	echo
+}
+
+do_stop() {
+	echo -n $"Shutting down ${NAME}: "
+	killproc -p "$pidfile" && /bin/rm -f "$pidfile"
+	echo
+}
+
+case "$1" in
+start)
+	do_start
+	;;
+stop)
+	do_stop
+	;;
+restart)
+	do_stop
+	sleep $DODTIME
+	do_start
+	;;
+status)
+	status -p "$pidfile" "$NAME"
+	;;
+
+*)
+	echo "Usage: $0 {start|stop|restart|status}" >&2
+	exit 3
+	;;
+esac

@@ -1,0 +1,56 @@
+##################################################
+# Quick Installation:
+##################################################
+
+Execute ./install.sh 
+
+... if you have suggestions or code to contribute,
+please send them to pwhois-support@pwhois.org.
+
+
+##################################################
+# Additional Installation Details:
+##################################################
+
+pwhoisd (the service daemon part of the system) is written in C and
+the loader script (pwhois-updatedb) is written in PERL and requires a
+new PERL system (5.6 or later, however 5.8.X is preferrable).
+
+It also requires MySQL (we recommend 5.6)
+The DBD::mysql modules and libmysqlclient is required.
+
+Several other PERL modules are also required.  See install.sh
+
+To install, enter './install.sh' (as root) on the command-line and
+the installation should commence. It will ask various questions
+and isn't very robust, but may assist in the process of the install.
+There are very few components.  Should you wish to install manually,
+it shouldn't be difficult.
+
+The primary steps are:
+
+1. Create the User/Group for the pwhoisd process to run as
+2. Install the binaries into their permanent locations we like /usr/sbin
+        or /usr/local/sbin
+3. Setup the init script if warranted (see  the contrib/init directory)
+4. Create the database, user/password and import the tables. (See the
+        mysql/ directory for scripts to create these
+        tables and the SQL commands.
+5. Setup the cron entry to execute the pwhois-updatedb command at a defined
+        interval.  A sample crontab file is provided as an example of what we run.
+6. Edit the pwhoisd.conf configuration file, usually placed in
+        /etc/pwhois/pwhoisd.conf
+6a. Import your first set of data using the pwhois-updatedb command
+6b. If using ARIN database for WHOIS resolution, download the data from ARIN using the
+ pwhois-arin-snapshot-load script.  You will need to have an account with ARIN to do this. 
+ (sorry, we can't give you access to do that ourselves). see: http://www.arin.net
+6c. If using a GEO database, download feed of data and use geo-update.sql 
+(you will have to modify to point it at the location of your CSV file, and may have to modify the structure of the table accordingly),
+to load the data.  
+
+7. Start the pwhoisd server process
+
+You are now ready to connect to your server and try it out.
+
+        $ whois -h localhost <ip>
+

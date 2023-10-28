@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+
+# PROVIDE: pwhoisd
+# REQUIRE: DAEMON cleanvar
+
+. /etc/rc.subr
+
+name="pwhoisd"
+rcvar=`set_rcvar`
+command="/usr/local/sbin/${name}"
+command_args="-d -v"
+pidfile="/var/run/${name}.pid"
+required_files="/etc/pwhois/pwhoisd.conf"
+extra_commands="reload"
+reload_cmd="kill -1 `cat ${pidfile}`"
+
+#LD_LIBRARY_PATH=/usr/local/lib; export LD_LIBRARY_PATH
+
+load_rc_config $name
+run_rc_command "$1"
